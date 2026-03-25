@@ -2,6 +2,15 @@
 
 This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
 
+Go to Windows variables, add user Variable -> ANDROID_HOME = C:\Users\Zhijie\AppData\Local\Android\Sdk
+
+```
+npx expo run:android
+
+npx expo start
+# 或者 npx expo start --dev-client
+```
+
 ## Get started
 
 1. Install dependencies

@@ -3,22 +3,22 @@ import { Linking, Pressable, StyleSheet } from 'react-native';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 
-const OSM_WEB_URL = 'https://www.openstreetmap.org';
+const VECTOR_WEB_URL = 'http://localhost:8080/spain?token=my_secret_key';
 
 export default function OpenStreetMapTestWebScreen() {
   return (
     <ThemedView style={styles.container}>
       <ThemedText type="title">OpenStreetMap 测试（Web）</ThemedText>
       <ThemedText>
-        Web 端不会加载 react-native-maps，避免 Metro 报错。请在 iOS/Android 上测试地图与定位权限逻辑。
+        当前默认打开本地矢量服务（spain）。如需切换中国数据，把 URL 中的 spain 改为 china 即可。
       </ThemedText>
 
       <Pressable
         onPress={() => {
-          void Linking.openURL(OSM_WEB_URL);
+          void Linking.openURL(VECTOR_WEB_URL);
         }}
         style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}>
-        <ThemedText type="defaultSemiBold">在浏览器打开 OpenStreetMap</ThemedText>
+        <ThemedText type="defaultSemiBold">在浏览器打开本地矢量地图（spain）</ThemedText>
       </Pressable>
     </ThemedView>
   );
