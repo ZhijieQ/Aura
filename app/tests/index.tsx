@@ -7,8 +7,8 @@ import { ThemedView } from '@/components/themed-view';
 const TEST_ITEMS = [
   {
     key: 'openstreetmap',
-    title: 'OpenStreetMap 测试',
-    desc: '验证地图渲染、定位权限弹窗、当前位置标记显示。',
+    title: 'MapLibre Android 测试',
+    desc: '验证 Android 端地图渲染、定位权限与当前位置标记。',
     href: '/tests/openstreetmap' as const,
   },
 ];

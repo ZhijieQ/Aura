@@ -9,6 +9,9 @@ npx expo run:android
 
 npx expo start
 # 或者 npx expo start --dev-client
+
+Remove-Item -Recurse -Force android\app\.cxx -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force android\app\build -ErrorAction SilentlyContinue
 ```
 
 ## Get started
