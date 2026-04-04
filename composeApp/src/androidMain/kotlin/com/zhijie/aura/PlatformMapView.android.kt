@@ -342,7 +342,9 @@ private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: Lat
 }
 
 private fun Context.createUserLocationBlueDotIcon(): Icon {
-    val sizePx = 36
+    val density = resources.displayMetrics.density
+    val sizePx = (28f * density).toInt().coerceAtLeast(36)
+    val scale = sizePx / 36f
     val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
     val center = sizePx / 2f
@@ -351,19 +353,19 @@ private fun Context.createUserLocationBlueDotIcon(): Icon {
         color = 0x66389BFF
         style = Paint.Style.FILL
     }
-    canvas.drawCircle(center, center, 16f, outerPaint)
+    canvas.drawCircle(center, center, 16f * scale, outerPaint)
 
     val whiteStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFFFFFFF.toInt()
         style = Paint.Style.FILL
     }
-    canvas.drawCircle(center, center, 9f, whiteStrokePaint)
+    canvas.drawCircle(center, center, 9f * scale, whiteStrokePaint)
 
     val blueCorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFF1A73E8.toInt()
         style = Paint.Style.FILL
     }
-    canvas.drawCircle(center, center, 6f, blueCorePaint)
+    canvas.drawCircle(center, center, 6f * scale, blueCorePaint)
 
     return IconFactory.getInstance(this).fromBitmap(bitmap)
 }
