@@ -1,5 +1,13 @@
 This is a Kotlin Multiplatform project targeting Android, iOS, Web.
 
+## Map setup
+
+- The app entry (`App`) now opens a shared map screen.
+- Android uses MapLibre Native SDK and loads style from:
+  `https://osm.zhijie.win/styles/bright.json`
+- iOS/Web currently keep the same shared API and show a placeholder map container,
+  so Android remains the primary runnable map target while multi-platform architecture is preserved.
+
 * [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
   It contains several subfolders:
     - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.
