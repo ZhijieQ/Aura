@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
@@ -46,6 +47,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import kotlinx.coroutines.delay
 import org.maplibre.android.MapLibre
 import org.maplibre.android.annotations.Icon
 import org.maplibre.android.annotations.IconFactory
@@ -85,7 +87,10 @@ actual fun PlatformMapView(
     var userLocationMarker by remember { mutableStateOf<Marker?>(null) }
     var loadedStyleUrl by remember { mutableStateOf<String?>(null) }
     var isLocationServiceEnabled by remember { mutableStateOf(context.isLocationServiceEnabled()) }
-    var locateStatusText by remember { mutableStateOf("等待定位") }
+    var showPermissionCard by remember { mutableStateOf(false) }
+    var showGpsCard by remember { mutableStateOf(false) }
+    var permissionReminderTrigger by remember { mutableStateOf(0) }
+    var gpsReminderTrigger by remember { mutableStateOf(0) }
     val userLocationIcon = remember { context.createUserLocationBlueDotIcon() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -98,12 +103,20 @@ actual fun PlatformMapView(
             context.isLocationPermissionPermanentlyDenied() -> LocationPermissionState.PermanentlyDenied
             else -> LocationPermissionState.Denied
         }
+
+        if (permissionState == LocationPermissionState.Granted) {
+            showPermissionCard = false
+        } else {
+            showPermissionCard = true
+            permissionReminderTrigger += 1
+        }
     }
 
     val locateUser: (Boolean) -> Unit = { shouldFocus ->
         if (!context.hasLocationPermission()) {
-            locateStatusText = "未授予定位权限，正在请求权限"
             hasRequestedPermission = true
+            showPermissionCard = true
+            permissionReminderTrigger += 1
             permissionLauncher.launch(
                 arrayOf(
                     Manifest.permission.ACCESS_FINE_LOCATION,
@@ -112,11 +125,13 @@ actual fun PlatformMapView(
             )
         } else if (!context.isLocationServiceEnabled()) {
             isLocationServiceEnabled = false
-            locateStatusText = "定位服务未开启，请先开启 GPS"
+            showGpsCard = true
+            gpsReminderTrigger += 1
         } else {
             isLocationServiceEnabled = true
-            locateStatusText = "正在获取当前位置..."
-            context.requestCurrentLatLng { latLng, fromLastKnown ->
+            showPermissionCard = false
+            showGpsCard = false
+            context.requestCurrentLatLng { latLng, _ ->
                 userLocation = latLng
                 if (latLng != null) {
                     userLocationMarker = mapLibreMap?.updateUserMarker(userLocationMarker, latLng, userLocationIcon)
@@ -126,13 +141,6 @@ actual fun PlatformMapView(
                             hasCenteredOnUserLocation = true
                         }
                     }
-                    locateStatusText = if (fromLastKnown) {
-                        "已获取位置（来自上次记录）"
-                    } else {
-                        "定位成功"
-                    }
-                } else {
-                    locateStatusText = "未获取到当前位置，请在空旷处稍后重试"
                 }
             }
         }
@@ -142,25 +150,32 @@ actual fun PlatformMapView(
     LaunchedEffect(Unit) {
         isLocationServiceEnabled = context.isLocationServiceEnabled()
         if (!hasLocationPermission) {
-            locateStatusText = "未授予定位权限，正在请求权限"
             permissionLauncher.launch(
                 arrayOf(
                     Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION,
                 ),
             )
-        } else if (!isLocationServiceEnabled) {
-            locateStatusText = "定位服务未开启，请先开启 GPS"
         }
     }
 
     LaunchedEffect(permissionState) {
         if (permissionState == LocationPermissionState.Granted) {
             locateUser(!hasCenteredOnUserLocation)
-        } else if (permissionState == LocationPermissionState.PermanentlyDenied) {
-            locateStatusText = "定位权限被永久拒绝，请到设置开启"
-        } else {
-            locateStatusText = "未授予定位权限"
+        }
+    }
+
+    LaunchedEffect(permissionReminderTrigger) {
+        if (permissionReminderTrigger > 0) {
+            delay(3500)
+            showPermissionCard = false
+        }
+    }
+
+    LaunchedEffect(gpsReminderTrigger) {
+        if (gpsReminderTrigger > 0) {
+            delay(3500)
+            showGpsCard = false
         }
     }
 
@@ -184,8 +199,17 @@ actual fun PlatformMapView(
                     } else {
                         LocationPermissionState.Denied
                     }
+
                     if (hasLocationPermission) {
+                        showPermissionCard = false
+                        if (!isLocationServiceEnabled) {
+                            showGpsCard = true
+                            gpsReminderTrigger += 1
+                        }
                         locateUser(!hasCenteredOnUserLocation)
+                    } else {
+                        showPermissionCard = true
+                        permissionReminderTrigger += 1
                     }
                 }
                 Lifecycle.Event.ON_PAUSE -> mapView.onPause()
@@ -205,6 +229,11 @@ actual fun PlatformMapView(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        val reminderCardModifier = Modifier
+            .align(Alignment.TopCenter)
+            .statusBarsPadding()
+            .padding(start = 16.dp, end = 16.dp, top = 40.dp)
+
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { mapView },
@@ -237,11 +266,9 @@ actual fun PlatformMapView(
             },
         )
 
-        if (permissionState != LocationPermissionState.Granted) {
+        if (permissionState != LocationPermissionState.Granted && showPermissionCard) {
             Card(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(16.dp),
+                modifier = reminderCardModifier,
             ) {
                 Column(
                     modifier = Modifier.padding(12.dp),
@@ -276,6 +303,23 @@ actual fun PlatformMapView(
                     }
                 }
             }
+        } else if (!isLocationServiceEnabled && showGpsCard) {
+            Card(
+                modifier = reminderCardModifier,
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "定位服务未开启，请先开启 GPS。",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(onClick = { context.openLocationSettings() }) {
+                        Text("去开启 GPS")
+                    }
+                }
+            }
         }
 
         FloatingActionButton(
@@ -287,33 +331,6 @@ actual fun PlatformMapView(
             },
         ) {
             Text("定位")
-        }
-
-        Card(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(start = 16.dp, end = 16.dp, bottom = 88.dp),
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                val currentLocation = userLocation
-                Text("定位状态: $locateStatusText", style = MaterialTheme.typography.bodyMedium)
-                Text(
-                    text = if (currentLocation != null) {
-                        "当前位置: ${currentLocation.latitude}, ${currentLocation.longitude}"
-                    } else {
-                        "当前位置: 未获取到"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                if (!isLocationServiceEnabled) {
-                    TextButton(onClick = { context.openLocationSettings() }) {
-                        Text("去开启 GPS")
-                    }
-                }
-            }
         }
     }
 }
