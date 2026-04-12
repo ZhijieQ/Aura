@@ -29,6 +29,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -200,9 +201,28 @@ actual fun PlatformMapView(
     val listSheetScaffoldState = rememberBottomSheetScaffoldState(
         bottomSheetState = listSheetState,
     )
-    val shouldDimTowardTop = activeTab == BottomNavTab.List &&
-        listSheetState.currentValue == SheetValue.Expanded
-    val dimTarget = if (!isSearchPageOpen && shouldDimTowardTop) 0.18f else 0f
+    var partialSheetOffsetPx by remember { mutableStateOf<Float?>(null) }
+    var expandedSheetOffsetPx by remember { mutableStateOf<Float?>(null) }
+    val listExpandProgress by remember(activeTab, isSearchPageOpen, listSheetState) {
+        derivedStateOf {
+            if (isSearchPageOpen || activeTab != BottomNavTab.List) {
+                return@derivedStateOf 0f
+            }
+
+            val fallbackProgress = if (listSheetState.currentValue == SheetValue.Expanded) 1f else 0f
+            val currentOffset = runCatching { listSheetState.requireOffset() }.getOrNull()
+                ?: return@derivedStateOf fallbackProgress
+
+            val partialOffset = partialSheetOffsetPx
+            val expandedOffset = expandedSheetOffsetPx
+            if (partialOffset == null || expandedOffset == null || partialOffset <= expandedOffset) {
+                return@derivedStateOf fallbackProgress
+            }
+
+            ((partialOffset - currentOffset) / (partialOffset - expandedOffset)).coerceIn(0f, 1f)
+        }
+    }
+    val dimTarget = 0.18f * listExpandProgress
     val mapDimAlpha by animateFloatAsState(
         targetValue = dimTarget,
         animationSpec = tween(durationMillis = 220),
@@ -243,6 +263,16 @@ actual fun PlatformMapView(
                 }
                 return Velocity.Zero
             }
+        }
+    }
+
+    LaunchedEffect(activeTab, isSearchPageOpen, listSheetState.currentValue) {
+        if (activeTab != BottomNavTab.List || isSearchPageOpen) return@LaunchedEffect
+        val offset = runCatching { listSheetState.requireOffset() }.getOrNull() ?: return@LaunchedEffect
+        when (listSheetState.currentValue) {
+            SheetValue.PartiallyExpanded -> partialSheetOffsetPx = offset
+            SheetValue.Expanded -> expandedSheetOffsetPx = offset
+            SheetValue.Hidden -> Unit
         }
     }
 
