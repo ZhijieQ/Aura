@@ -187,6 +187,15 @@ actual fun PlatformMapView(
     val listSheetState = rememberStandardBottomSheetState(
         initialValue = SheetValue.Hidden,
         skipHiddenState = false,
+        confirmValueChange = { targetValue ->
+            if (activeTab == BottomNavTab.List && targetValue == SheetValue.Hidden) {
+                // When user drags down to the bottom in list mode, settle on tiny instead of Hidden.
+                listPeekMode = ListPeekMode.Tiny
+                false
+            } else {
+                true
+            }
+        },
     )
     val listSheetScaffoldState = rememberBottomSheetScaffoldState(
         bottomSheetState = listSheetState,
@@ -209,6 +218,15 @@ actual fun PlatformMapView(
                 ) {
                     // Promote tiny -> half on upward drag so the middle anchor is reachable again.
                     listPeekMode = ListPeekMode.Half
+                } else if (
+                    activeTab == BottomNavTab.List &&
+                    source == NestedScrollSource.UserInput &&
+                    listPeekMode == ListPeekMode.Half &&
+                    listSheetState.currentValue == SheetValue.PartiallyExpanded &&
+                    available.y > 1f
+                ) {
+                    // When dragging down from half, snap to tiny (header-only) instead of rebounding to half.
+                    listPeekMode = ListPeekMode.Tiny
                 }
                 return Offset.Zero
             }
@@ -382,14 +400,7 @@ actual fun PlatformMapView(
                     listPeekMode = ListPeekMode.Half
                 }
             }
-            SheetValue.Hidden -> {
-                if (listPeekMode == ListPeekMode.Full) {
-                    listSheetState.expand()
-                } else {
-                    listPeekMode = ListPeekMode.Tiny
-                    listSheetState.partialExpand()
-                }
-            }
+            SheetValue.Hidden -> Unit
         }
     }
 
