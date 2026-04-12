@@ -24,6 +24,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -32,6 +34,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,9 +45,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -51,7 +61,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.core.app.ActivityCompat
@@ -61,20 +74,29 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.material3.Card
 import androidx.compose.material3.Divider
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.BottomSheetScaffold
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
+import androidx.compose.material3.rememberBottomSheetScaffoldState
+import androidx.compose.material3.rememberStandardBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
-import org.maplibre.android.annotations.Icon
+import org.maplibre.android.annotations.Icon as MapLibreIcon
 import org.maplibre.android.annotations.IconFactory
 import org.maplibre.android.annotations.Marker
 import org.maplibre.android.annotations.MarkerOptions
@@ -84,16 +106,30 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.Style
 import org.maplibre.android.maps.MapView
+import com.zhijie.aura.search.SemanticQueryParser
+import com.zhijie.aura.search.SemanticTag
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.Locale
 
 private enum class LocationPermissionState {
     Granted,
     Denied,
     PermanentlyDenied,
+}
+
+private enum class BottomNavTab {
+    Map,
+    List,
+}
+
+private enum class ListPeekMode {
+    Full,
+    Half,
+    Tiny,
 }
 
 private data class PhotonSearchResult(
@@ -103,7 +139,7 @@ private data class PhotonSearchResult(
 )
 
 @Composable
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 actual fun PlatformMapView(
     modifier: Modifier,
     config: MapConfig,
@@ -138,7 +174,59 @@ actual fun PlatformMapView(
     var selectedSearchResult by remember { mutableStateOf<PhotonSearchResult?>(null) }
     var immediateSearchToken by remember { mutableStateOf(0) }
     var pendingDeleteRecentSearch by remember { mutableStateOf<PhotonSearchResult?>(null) }
+    var activeTab by remember { mutableStateOf(BottomNavTab.Map) }
+    var listPeekMode by remember { mutableStateOf(ListPeekMode.Full) }
+    val bottomBarHeight = 80.dp
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val density = LocalDensity.current
+    val halfPeekHeight = (screenHeight * 0.42f).coerceAtLeast(220.dp).coerceAtMost(360.dp)
+    val tinyPeekHeight = 88.dp
+    val fastDownFlingThreshold = with(density) { 2200.dp.toPx() }
+    val listSheetPeekHeight = if (listPeekMode == ListPeekMode.Tiny) tinyPeekHeight else halfPeekHeight
     val userLocationIcon = remember { context.createUserLocationBlueDotIcon() }
+    val listSheetState = rememberStandardBottomSheetState(
+        initialValue = SheetValue.Hidden,
+        skipHiddenState = false,
+    )
+    val listSheetScaffoldState = rememberBottomSheetScaffoldState(
+        bottomSheetState = listSheetState,
+    )
+    val shouldDimTowardTop = activeTab == BottomNavTab.List &&
+        listSheetState.currentValue == SheetValue.Expanded
+    val dimTarget = if (!isSearchPageOpen && shouldDimTowardTop) 0.18f else 0f
+    val mapDimAlpha by animateFloatAsState(
+        targetValue = dimTarget,
+        animationSpec = tween(durationMillis = 220),
+        label = "mapDimAlpha",
+    )
+    val listSheetGestureConnection = remember(activeTab, listPeekMode, fastDownFlingThreshold) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (
+                    activeTab == BottomNavTab.List &&
+                    listPeekMode == ListPeekMode.Tiny &&
+                    available.y < -1f
+                ) {
+                    // Promote tiny -> half on upward drag so the middle anchor is reachable again.
+                    listPeekMode = ListPeekMode.Half
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                val shouldSnapTiny =
+                    activeTab == BottomNavTab.List &&
+                        available.y > fastDownFlingThreshold &&
+                        listSheetState.currentValue != SheetValue.Hidden
+                if (shouldSnapTiny) {
+                    listPeekMode = ListPeekMode.Tiny
+                    listSheetState.partialExpand()
+                    return available
+                }
+                return Velocity.Zero
+            }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
@@ -228,10 +316,19 @@ actual fun PlatformMapView(
 
     suspend fun runSearch(query: String) {
         val biasCenter = userLocation ?: mapLibreMap?.cameraPosition?.target
+        val parsed = SemanticQueryParser.parse(
+            query = query,
+            languageCode = Locale.getDefault().language,
+            countryCode = Locale.getDefault().country,
+        )
         isSearching = true
         searchError = null
         runCatching {
-            searchPhoton(query = query, biasCenter = biasCenter)
+            searchPhoton(
+                query = parsed.effectiveQuery,
+                biasCenter = biasCenter,
+                semanticTags = parsed.semanticTags,
+            )
         }.onSuccess {
             searchResults = it
         }.onFailure {
@@ -265,6 +362,49 @@ actual fun PlatformMapView(
             return@LaunchedEffect
         }
         runSearch(query)
+    }
+
+    LaunchedEffect(activeTab) {
+        if (activeTab == BottomNavTab.List) {
+            listPeekMode = ListPeekMode.Full
+            listSheetState.expand()
+        } else if (listSheetState.currentValue != SheetValue.Hidden) {
+            listSheetState.hide()
+        }
+    }
+
+    LaunchedEffect(listSheetState.currentValue, activeTab, listPeekMode) {
+        if (activeTab != BottomNavTab.List) return@LaunchedEffect
+        when (listSheetState.currentValue) {
+            SheetValue.Expanded -> listPeekMode = ListPeekMode.Full
+            SheetValue.PartiallyExpanded -> {
+                if (listPeekMode == ListPeekMode.Full) {
+                    listPeekMode = ListPeekMode.Half
+                }
+            }
+            SheetValue.Hidden -> {
+                if (listPeekMode == ListPeekMode.Full) {
+                    listSheetState.expand()
+                } else {
+                    listPeekMode = ListPeekMode.Tiny
+                    listSheetState.partialExpand()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(listSheetState.targetValue, activeTab) {
+        if (activeTab != BottomNavTab.List) return@LaunchedEffect
+        if (listSheetState.targetValue == SheetValue.PartiallyExpanded && listPeekMode == ListPeekMode.Full) {
+            // Drag-release near the middle should settle on half mode.
+            listPeekMode = ListPeekMode.Half
+        }
+    }
+
+    LaunchedEffect(isSearchPageOpen) {
+        if (isSearchPageOpen && activeTab == BottomNavTab.List) {
+            activeTab = BottomNavTab.Map
+        }
     }
 
     val mapView = remember {
@@ -376,7 +516,17 @@ actual fun PlatformMapView(
             },
         )
 
-        Card(modifier = searchCardModifier.clickable { isSearchPageOpen = true }) {
+        if (mapDimAlpha > 0.001f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = mapDimAlpha))
+                    .zIndex(1f),
+            )
+        }
+
+        if (!isSearchPageOpen && activeTab == BottomNavTab.Map) {
+            Card(modifier = searchCardModifier.clickable { isSearchPageOpen = true }) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -409,6 +559,7 @@ actual fun PlatformMapView(
                     }
                 }
             }
+        }
         }
 
         if (permissionState != LocationPermissionState.Granted && showPermissionCard) {
@@ -467,15 +618,142 @@ actual fun PlatformMapView(
             }
         }
 
-        FloatingActionButton(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp),
-            onClick = {
-                locateUser(true)
-            },
-        ) {
-            Text("定位")
+        if (!isSearchPageOpen) {
+            FloatingActionButton(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .zIndex(3f)
+                    .padding(end = 16.dp, bottom = bottomBarHeight + 16.dp),
+                onClick = {
+                    locateUser(true)
+                },
+            ) {
+                Text("定位")
+            }
+
+            BottomSheetScaffold(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = bottomBarHeight)
+                    .nestedScroll(listSheetGestureConnection)
+                    .zIndex(2f),
+                scaffoldState = listSheetScaffoldState,
+                sheetPeekHeight = listSheetPeekHeight,
+                containerColor = Color.Transparent,
+                sheetShape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                sheetContainerColor = MaterialTheme.colorScheme.surface,
+                sheetTonalElevation = 0.dp,
+                sheetShadowElevation = 0.dp,
+                sheetDragHandle = {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp, bottom = 4.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(36.dp)
+                                .height(4.dp)
+                                .background(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                                    shape = RoundedCornerShape(50),
+                                ),
+                        )
+                    }
+                },
+                sheetContent = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .fillMaxHeight(0.92f)
+                            .navigationBarsPadding()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("您的列表", style = MaterialTheme.typography.titleMedium)
+                            TextButton(onClick = { isSearchPageOpen = true }) {
+                                Text("添加列表")
+                            }
+                        }
+
+                        if (recentSearches.isEmpty()) {
+                            Text(
+                                text = "暂无列表，点击右上角添加",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(vertical = 8.dp),
+                            )
+                        } else {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .verticalScroll(rememberScrollState()),
+                            ) {
+                                recentSearches.forEachIndexed { index, result ->
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .combinedClickable(
+                                                onClick = {
+                                                    selectSearchResult(result)
+                                                    activeTab = BottomNavTab.Map
+                                                },
+                                                onLongClick = { pendingDeleteRecentSearch = result },
+                                            )
+                                            .padding(vertical = 10.dp),
+                                    ) {
+                                        Text(result.title, style = MaterialTheme.typography.bodyLarge)
+                                        result.subtitle?.let {
+                                            Text(it, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                    if (index != recentSearches.lastIndex) {
+                                        Divider(color = Color.LightGray)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            ) {
+                // Intentionally empty: map and overlays are rendered in sibling layers.
+            }
+
+            NavigationBar(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .zIndex(4f),
+                windowInsets = WindowInsets(0, 0, 0, 0),
+            ) {
+                NavigationBarItem(
+                    selected = activeTab == BottomNavTab.Map,
+                    onClick = { activeTab = BottomNavTab.Map },
+                    icon = {
+                        Icon(
+                            painter = painterResource(id = android.R.drawable.ic_menu_mapmode),
+                            contentDescription = "地图",
+                        )
+                    },
+                    label = { Text("地图") },
+                )
+                NavigationBarItem(
+                    selected = activeTab == BottomNavTab.List,
+                    onClick = { activeTab = BottomNavTab.List },
+                    icon = {
+                        Icon(
+                            painter = painterResource(id = android.R.drawable.ic_menu_agenda),
+                            contentDescription = "列表",
+                        )
+                    },
+                    label = { Text("列表") },
+                )
+            }
         }
 
         if (isSearchPageOpen) {
@@ -631,29 +909,30 @@ actual fun PlatformMapView(
                     }
                 }
 
-                pendingDeleteRecentSearch?.let { target ->
-                    AlertDialog(
-                        onDismissRequest = { pendingDeleteRecentSearch = null },
-                        title = { Text("删除历史记录") },
-                        text = { Text("确定删除“${target.title}”吗？") },
-                        confirmButton = {
-                            TextButton(
-                                onClick = {
-                                    recentSearches = context.deleteRecentSearch(target, recentSearches)
-                                    pendingDeleteRecentSearch = null
-                                },
-                            ) {
-                                Text("删除")
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(onClick = { pendingDeleteRecentSearch = null }) {
-                                Text("取消")
-                            }
-                        },
-                    )
-                }
             }
+        }
+
+        pendingDeleteRecentSearch?.let { target ->
+            AlertDialog(
+                onDismissRequest = { pendingDeleteRecentSearch = null },
+                title = { Text("删除历史记录") },
+                text = { Text("确定删除“${target.title}”吗？") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            recentSearches = context.deleteRecentSearch(target, recentSearches)
+                            pendingDeleteRecentSearch = null
+                        },
+                    ) {
+                        Text("删除")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingDeleteRecentSearch = null }) {
+                        Text("取消")
+                    }
+                },
+            )
         }
     }
 }
@@ -674,7 +953,7 @@ private fun MapLibreMap.focusOnSearchResult(searchLatLng: LatLng) {
     animateCamera(CameraUpdateFactory.newCameraPosition(camera))
 }
 
-private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: LatLng?, icon: Icon): Marker? {
+private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: LatLng?, icon: MapLibreIcon): Marker? {
     if (userLatLng == null) {
         currentMarker?.let { removeMarker(it) }
         return null
@@ -711,10 +990,22 @@ private suspend fun searchPhoton(
     query: String,
     limit: Int = 8,
     biasCenter: LatLng? = null,
+    semanticTags: Set<SemanticTag> = emptySet(),
 ): List<PhotonSearchResult> = withContext(Dispatchers.IO) {
-    val encodedQuery = URLEncoder.encode(query, "UTF-8")
-    val biasQuery = biasCenter?.let { "&lat=${it.latitude}&lon=${it.longitude}" }.orEmpty()
-    val requestUrl = URL("https://osm.zhijie.win/api/?q=$encodedQuery&limit=$limit$biasQuery")
+    val encodedQuery = URLEncoder.encode(query.ifBlank { "*" }, "UTF-8")
+    val baseParams = mutableListOf(
+        "q=$encodedQuery",
+        "limit=$limit",
+    )
+    biasCenter?.let {
+        baseParams += "lat=${it.latitude}"
+        baseParams += "lon=${it.longitude}"
+    }
+    semanticTags.forEach { tag ->
+        val encodedTag = URLEncoder.encode("${tag.key}:${tag.value}", "UTF-8")
+        baseParams += "osm_tag=$encodedTag"
+    }
+    val requestUrl = URL("https://osm.zhijie.win/api/?${baseParams.joinToString("&")}")
     val connection = (requestUrl.openConnection() as HttpURLConnection).apply {
         connectTimeout = 8000
         readTimeout = 8000
@@ -898,7 +1189,7 @@ private const val SEARCH_PREFS_NAME = "map_search"
 private const val RECENT_SEARCHES_KEY = "recent_searches"
 private const val MAX_RECENT_SEARCHES = 8
 
-private fun Context.createUserLocationBlueDotIcon(): Icon {
+private fun Context.createUserLocationBlueDotIcon(): MapLibreIcon {
     val density = resources.displayMetrics.density
     val sizePx = (28f * density).toInt().coerceAtLeast(36)
     val scale = sizePx / 36f
