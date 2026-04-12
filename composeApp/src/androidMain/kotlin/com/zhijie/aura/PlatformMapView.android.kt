@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -17,8 +18,12 @@ import android.os.Looper
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -30,24 +35,44 @@ import androidx.compose.ui.Modifier
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.material3.Card
+import androidx.compose.material3.Divider
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.ExperimentalFoundationApi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
 import org.maplibre.android.annotations.Icon
 import org.maplibre.android.annotations.IconFactory
@@ -59,6 +84,11 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.Style
 import org.maplibre.android.maps.MapView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 
 private enum class LocationPermissionState {
     Granted,
@@ -66,7 +96,14 @@ private enum class LocationPermissionState {
     PermanentlyDenied,
 }
 
+private data class PhotonSearchResult(
+    val title: String,
+    val subtitle: String?,
+    val latLng: LatLng,
+)
+
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 actual fun PlatformMapView(
     modifier: Modifier,
     config: MapConfig,
@@ -85,12 +122,22 @@ actual fun PlatformMapView(
     var hasCenteredOnUserLocation by remember { mutableStateOf(false) }
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
     var userLocationMarker by remember { mutableStateOf<Marker?>(null) }
+    var searchedLocationMarker by remember { mutableStateOf<Marker?>(null) }
     var loadedStyleUrl by remember { mutableStateOf<String?>(null) }
     var isLocationServiceEnabled by remember { mutableStateOf(context.isLocationServiceEnabled()) }
     var showPermissionCard by remember { mutableStateOf(false) }
     var showGpsCard by remember { mutableStateOf(false) }
     var permissionReminderTrigger by remember { mutableStateOf(0) }
     var gpsReminderTrigger by remember { mutableStateOf(0) }
+    var searchQuery by remember { mutableStateOf("") }
+    var isSearchPageOpen by remember { mutableStateOf(false) }
+    var isSearching by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf<String?>(null) }
+    var searchResults by remember { mutableStateOf<List<PhotonSearchResult>>(emptyList()) }
+    var recentSearches by remember { mutableStateOf(context.loadRecentSearches()) }
+    var selectedSearchResult by remember { mutableStateOf<PhotonSearchResult?>(null) }
+    var immediateSearchToken by remember { mutableStateOf(0) }
+    var pendingDeleteRecentSearch by remember { mutableStateOf<PhotonSearchResult?>(null) }
     val userLocationIcon = remember { context.createUserLocationBlueDotIcon() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -179,6 +226,47 @@ actual fun PlatformMapView(
         }
     }
 
+    suspend fun runSearch(query: String) {
+        val biasCenter = userLocation ?: mapLibreMap?.cameraPosition?.target
+        isSearching = true
+        searchError = null
+        runCatching {
+            searchPhoton(query = query, biasCenter = biasCenter)
+        }.onSuccess {
+            searchResults = it
+        }.onFailure {
+            searchResults = emptyList()
+            searchError = "搜索失败，请稍后重试"
+        }
+        isSearching = false
+    }
+
+    LaunchedEffect(searchQuery, isSearchPageOpen) {
+        if (!isSearchPageOpen) return@LaunchedEffect
+        val query = searchQuery.trim()
+        if (query.isEmpty()) {
+            isSearching = false
+            searchError = null
+            searchResults = emptyList()
+            return@LaunchedEffect
+        }
+
+        delay(350)
+        runSearch(query)
+    }
+
+    LaunchedEffect(immediateSearchToken) {
+        if (!isSearchPageOpen || immediateSearchToken == 0) return@LaunchedEffect
+        val query = searchQuery.trim()
+        if (query.isEmpty()) {
+            isSearching = false
+            searchError = null
+            searchResults = emptyList()
+            return@LaunchedEffect
+        }
+        runSearch(query)
+    }
+
     val mapView = remember {
         MapLibre.getInstance(context)
         MapView(context).apply { onCreate(null) }
@@ -229,10 +317,30 @@ actual fun PlatformMapView(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        val selectSearchResult: (PhotonSearchResult) -> Unit = { result ->
+            selectedSearchResult = result
+            searchQuery = result.title
+            isSearchPageOpen = false
+            searchResults = emptyList()
+            searchError = null
+            recentSearches = context.saveRecentSearch(result, recentSearches)
+
+            mapLibreMap?.let { map ->
+                searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, result)
+                map.focusOnSearchResult(result.latLng)
+            }
+        }
+
         val reminderCardModifier = Modifier
             .align(Alignment.TopCenter)
             .statusBarsPadding()
             .padding(start = 16.dp, end = 16.dp, top = 40.dp)
+
+        val searchCardModifier = Modifier
+            .align(Alignment.TopCenter)
+            .statusBarsPadding()
+            .padding(start = 16.dp, end = 16.dp, top = 8.dp)
+            .zIndex(2f)
 
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -249,6 +357,7 @@ actual fun PlatformMapView(
                             val zoom = if (userLocation != null) maxOf(config.camera.zoom, 15.0) else config.camera.zoom
                             map.cameraPosition = CameraPosition.Builder().target(target).zoom(zoom).build()
                             userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
+                            searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
                             if (userLocation != null && !hasCenteredOnUserLocation) {
                                 map.focusOnUser(userLocation!!, config.camera.zoom)
                                 hasCenteredOnUserLocation = true
@@ -256,6 +365,7 @@ actual fun PlatformMapView(
                         }
                     } else {
                         userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
+                        searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
                         val currentLocation = userLocation
                         if (currentLocation != null && !hasCenteredOnUserLocation) {
                             map.focusOnUser(currentLocation, config.camera.zoom)
@@ -265,6 +375,16 @@ actual fun PlatformMapView(
                 }
             },
         )
+
+        Card(modifier = searchCardModifier.clickable { isSearchPageOpen = true }) {
+            Text(
+                text = if (searchQuery.isBlank()) "搜索地点" else searchQuery,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
 
         if (permissionState != LocationPermissionState.Granted && showPermissionCard) {
             Card(
@@ -332,6 +452,184 @@ actual fun PlatformMapView(
         ) {
             Text("定位")
         }
+
+        if (isSearchPageOpen) {
+            BackHandler { isSearchPageOpen = false }
+
+            Surface(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+                    .zIndex(3f),
+                color = MaterialTheme.colorScheme.background,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "搜索",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = {
+                            searchQuery = it
+                            if (it.isBlank()) {
+                                searchError = null
+                                searchResults = emptyList()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        placeholder = { Text("搜索地点") },
+                        leadingIcon = {
+                            IconButton(onClick = { isSearchPageOpen = false }) {
+                                androidx.compose.material3.Icon(
+                                    painter = painterResource(id = android.R.drawable.ic_media_previous),
+                                    contentDescription = "返回",
+                                )
+                            }
+                        },
+                        trailingIcon = {
+                            if (searchQuery.isNotBlank()) {
+                                IconButton(
+                                    onClick = {
+                                        searchQuery = ""
+                                        searchError = null
+                                        searchResults = emptyList()
+                                    },
+                                ) {
+                                    androidx.compose.material3.Icon(
+                                        painter = painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
+                                        contentDescription = "清空搜索",
+                                    )
+                                }
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(
+                            onSearch = {
+                                immediateSearchToken += 1
+                            },
+                        ),
+                    )
+
+                    val panelModifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 560.dp)
+                        .verticalScroll(rememberScrollState())
+
+                    when {
+                        searchQuery.isBlank() -> {
+                            Column(modifier = panelModifier) {
+                                if (recentSearches.isEmpty()) {
+                                    Text(
+                                        text = "暂无最近搜索",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                } else {
+                                    recentSearches.forEachIndexed { index, result ->
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .combinedClickable(
+                                                    onClick = { selectSearchResult(result) },
+                                                    onLongClick = { pendingDeleteRecentSearch = result },
+                                                )
+                                                .padding(vertical = 10.dp),
+                                        ) {
+                                            Text(result.title, style = MaterialTheme.typography.bodyLarge)
+                                            result.subtitle?.let {
+                                                Text(it, style = MaterialTheme.typography.bodySmall)
+                                            }
+                                        }
+                                        if (index != recentSearches.lastIndex) {
+                                            Divider(color = Color.LightGray)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        isSearching -> {
+                            Text(
+                                text = "搜索中...",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+
+                        searchError != null -> {
+                            Text(
+                                text = searchError!!,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+
+                        searchResults.isEmpty() -> {
+                            Text(
+                                text = "未找到匹配地点",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+
+                        else -> {
+                            Column(modifier = panelModifier) {
+                                searchResults.forEachIndexed { index, result ->
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { selectSearchResult(result) }
+                                            .padding(vertical = 10.dp),
+                                    ) {
+                                        Text(result.title, style = MaterialTheme.typography.bodyLarge)
+                                        result.subtitle?.let {
+                                            Text(it, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                    if (index != searchResults.lastIndex) {
+                                        Divider(color = Color.LightGray)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                pendingDeleteRecentSearch?.let { target ->
+                    AlertDialog(
+                        onDismissRequest = { pendingDeleteRecentSearch = null },
+                        title = { Text("删除历史记录") },
+                        text = { Text("确定删除“${target.title}”吗？") },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    recentSearches = context.deleteRecentSearch(target, recentSearches)
+                                    pendingDeleteRecentSearch = null
+                                },
+                            ) {
+                                Text("删除")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { pendingDeleteRecentSearch = null }) {
+                                Text("取消")
+                            }
+                        },
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -339,6 +637,14 @@ private fun MapLibreMap.focusOnUser(userLatLng: LatLng, baseZoom: Double) {
     val camera = CameraPosition.Builder()
         .target(userLatLng)
         .zoom(maxOf(baseZoom, 15.0))
+        .build()
+    animateCamera(CameraUpdateFactory.newCameraPosition(camera))
+}
+
+private fun MapLibreMap.focusOnSearchResult(searchLatLng: LatLng) {
+    val camera = CameraPosition.Builder()
+        .target(searchLatLng)
+        .zoom(16.0)
         .build()
     animateCamera(CameraUpdateFactory.newCameraPosition(camera))
 }
@@ -357,6 +663,215 @@ private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: Lat
             .title("My location"),
     )
 }
+
+private fun MapLibreMap.updateSearchMarker(
+    currentMarker: Marker?,
+    searchResult: PhotonSearchResult?,
+): Marker? {
+    if (searchResult == null) {
+        currentMarker?.let { removeMarker(it) }
+        return null
+    }
+
+    currentMarker?.let { removeMarker(it) }
+    return addMarker(
+        MarkerOptions()
+            .position(searchResult.latLng)
+            .title(searchResult.title)
+            .snippet(searchResult.subtitle ?: ""),
+    )
+}
+
+private suspend fun searchPhoton(
+    query: String,
+    limit: Int = 8,
+    biasCenter: LatLng? = null,
+): List<PhotonSearchResult> = withContext(Dispatchers.IO) {
+    val encodedQuery = URLEncoder.encode(query, "UTF-8")
+    val biasQuery = biasCenter?.let { "&lat=${it.latitude}&lon=${it.longitude}" }.orEmpty()
+    val requestUrl = URL("https://osm.zhijie.win/api/?q=$encodedQuery&limit=$limit$biasQuery")
+    val connection = (requestUrl.openConnection() as HttpURLConnection).apply {
+        connectTimeout = 8000
+        readTimeout = 8000
+        requestMethod = "GET"
+        setRequestProperty("Accept", "application/json")
+    }
+
+    try {
+        val responseCode = connection.responseCode
+        if (responseCode !in 200..299) {
+            throw IllegalStateException("HTTP $responseCode")
+        }
+
+        val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
+        parsePhotonResults(responseBody)
+            .prioritizeByDistance(biasCenter)
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun List<PhotonSearchResult>.prioritizeByDistance(
+    biasCenter: LatLng?,
+): List<PhotonSearchResult> {
+    if (biasCenter == null || isEmpty()) return this
+
+    // Keep Photon text relevance while nudging nearby places to the top.
+    return withIndex()
+        .sortedWith(
+            compareBy<IndexedValue<PhotonSearchResult>> {
+                distanceBucketMeters(biasCenter, it.value.latLng)
+            }.thenBy { it.index },
+        )
+        .map { it.value }
+}
+
+private fun distanceBucketMeters(center: LatLng, point: LatLng): Int {
+    val distanceResults = FloatArray(1)
+    Location.distanceBetween(
+        center.latitude,
+        center.longitude,
+        point.latitude,
+        point.longitude,
+        distanceResults,
+    )
+    val distance = distanceResults[0]
+    return when {
+        distance <= 1_500f -> 0
+        distance <= 5_000f -> 1
+        distance <= 15_000f -> 2
+        distance <= 40_000f -> 3
+        distance <= 120_000f -> 4
+        else -> 5
+    }
+}
+
+private fun parsePhotonResults(responseBody: String): List<PhotonSearchResult> {
+    val jsonObject = JSONObject(responseBody)
+    val features = jsonObject.optJSONArray("features") ?: return emptyList()
+    val results = mutableListOf<PhotonSearchResult>()
+
+    for (index in 0 until features.length()) {
+        val feature = features.optJSONObject(index) ?: continue
+        val geometry = feature.optJSONObject("geometry") ?: continue
+        val coordinates = geometry.optJSONArray("coordinates") ?: continue
+        val longitude = coordinates.optDouble(0, Double.NaN)
+        val latitude = coordinates.optDouble(1, Double.NaN)
+        if (!latitude.isFinite() || !longitude.isFinite()) continue
+
+        val properties = feature.optJSONObject("properties")
+        val name = properties?.optString("name").orEmpty()
+        val city = properties?.optString("city").orEmpty()
+        val state = properties?.optString("state").orEmpty()
+        val country = properties?.optString("country").orEmpty()
+        val street = properties?.optString("street").orEmpty()
+        val houseNumber = properties?.optString("housenumber").orEmpty()
+
+        val title = name
+            .ifBlank { listOfNotNull(street.takeIf { it.isNotBlank() }, houseNumber.takeIf { it.isNotBlank() }).joinToString(" ") }
+            .ifBlank { city }
+            .ifBlank { country }
+            .ifBlank { "未命名地点" }
+
+        val subtitle = listOf(street, city, state, country)
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString(", ")
+            .ifBlank { null }
+
+        results += PhotonSearchResult(
+            title = title,
+            subtitle = subtitle,
+            latLng = LatLng(latitude, longitude),
+        )
+    }
+
+    return results
+}
+
+private fun Context.loadRecentSearches(): List<PhotonSearchResult> {
+    val sharedPreferences = getSearchSharedPreferences()
+    val raw = sharedPreferences.getString(RECENT_SEARCHES_KEY, null) ?: return emptyList()
+    return runCatching {
+        val jsonArray = JSONArray(raw)
+        buildList {
+            for (index in 0 until jsonArray.length()) {
+                val item = jsonArray.optJSONObject(index) ?: continue
+                val title = item.optString("title")
+                val subtitle = item.optString("subtitle").ifBlank { null }
+                val latitude = item.optDouble("latitude", Double.NaN)
+                val longitude = item.optDouble("longitude", Double.NaN)
+                if (!latitude.isFinite() || !longitude.isFinite() || title.isBlank()) continue
+
+                add(
+                    PhotonSearchResult(
+                        title = title,
+                        subtitle = subtitle,
+                        latLng = LatLng(latitude, longitude),
+                    ),
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun Context.saveRecentSearch(
+    latest: PhotonSearchResult,
+    current: List<PhotonSearchResult>,
+): List<PhotonSearchResult> {
+    val updated = (listOf(latest) + current)
+        .distinctBy { "${it.title}:${it.latLng.latitude}:${it.latLng.longitude}" }
+        .take(MAX_RECENT_SEARCHES)
+
+    val jsonArray = JSONArray()
+    updated.forEach { item ->
+        jsonArray.put(
+            JSONObject().apply {
+                put("title", item.title)
+                put("subtitle", item.subtitle ?: "")
+                put("latitude", item.latLng.latitude)
+                put("longitude", item.latLng.longitude)
+            },
+        )
+    }
+
+    getSearchSharedPreferences().edit().putString(RECENT_SEARCHES_KEY, jsonArray.toString()).apply()
+    return updated
+}
+
+private fun Context.deleteRecentSearch(
+    target: PhotonSearchResult,
+    current: List<PhotonSearchResult>,
+): List<PhotonSearchResult> {
+    val updated = current.filterNot {
+        it.title == target.title &&
+            it.latLng.latitude == target.latLng.latitude &&
+            it.latLng.longitude == target.latLng.longitude
+    }
+
+    val jsonArray = JSONArray()
+    updated.forEach { item ->
+        jsonArray.put(
+            JSONObject().apply {
+                put("title", item.title)
+                put("subtitle", item.subtitle ?: "")
+                put("latitude", item.latLng.latitude)
+                put("longitude", item.latLng.longitude)
+            },
+        )
+    }
+
+    getSearchSharedPreferences().edit().putString(RECENT_SEARCHES_KEY, jsonArray.toString()).apply()
+    return updated
+}
+
+private fun Context.getSearchSharedPreferences(): SharedPreferences {
+    return getSharedPreferences(SEARCH_PREFS_NAME, Context.MODE_PRIVATE)
+}
+
+private const val SEARCH_PREFS_NAME = "map_search"
+private const val RECENT_SEARCHES_KEY = "recent_searches"
+private const val MAX_RECENT_SEARCHES = 8
 
 private fun Context.createUserLocationBlueDotIcon(): Icon {
     val density = resources.displayMetrics.density
