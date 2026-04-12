@@ -377,13 +377,38 @@ actual fun PlatformMapView(
         )
 
         Card(modifier = searchCardModifier.clickable { isSearchPageOpen = true }) {
-            Text(
-                text = if (searchQuery.isBlank()) "搜索地点" else searchQuery,
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 14.dp),
-                style = MaterialTheme.typography.bodyLarge,
-            )
+                    .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = if (searchQuery.isBlank()) "搜索地点" else searchQuery,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+
+                if (searchQuery.isNotBlank()) {
+                    IconButton(
+                        onClick = {
+                            searchQuery = ""
+                            searchError = null
+                            searchResults = emptyList()
+                            selectedSearchResult = null
+                            searchedLocationMarker = mapLibreMap?.updateSearchMarker(
+                                searchedLocationMarker,
+                                null,
+                            )
+                        },
+                    ) {
+                        androidx.compose.material3.Icon(
+                            painter = painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
+                            contentDescription = "清空搜索",
+                        )
+                    }
+                }
+            }
         }
 
         if (permissionState != LocationPermissionState.Granted && showPermissionCard) {
