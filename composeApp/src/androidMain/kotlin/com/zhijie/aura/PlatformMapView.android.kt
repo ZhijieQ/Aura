@@ -82,8 +82,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.BottomSheetScaffold
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
@@ -183,6 +186,11 @@ actual fun PlatformMapView(
     var favoriteFolders by remember { mutableStateOf(context.loadFavoriteFolders()) }
     var selectedFavoriteFolderId by remember { mutableStateOf<String?>(favoriteFolders.firstOrNull()?.id) }
     var pendingAddToFavoriteFolderId by remember { mutableStateOf<String?>(null) }
+    var pendingPreferredCollectionFolderId by remember { mutableStateOf<String?>(null) }
+    var showPlaceDetailPanel by remember { mutableStateOf(false) }
+    var showPlaceCollectionsDialog by remember { mutableStateOf(false) }
+    var placeFolderDraftIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var placeActionHint by remember { mutableStateOf<String?>(null) }
     var showCreateFavoriteDialog by remember { mutableStateOf(false) }
     var newFavoriteName by remember { mutableStateOf("") }
     var createFavoriteError by remember { mutableStateOf<String?>(null) }
@@ -376,6 +384,13 @@ actual fun PlatformMapView(
         }
     }
 
+    LaunchedEffect(placeActionHint) {
+        if (placeActionHint != null) {
+            delay(1800)
+            placeActionHint = null
+        }
+    }
+
     suspend fun runSearch(query: String) {
         val biasCenter = userLocation ?: mapLibreMap?.cameraPosition?.target
         val parsed = SemanticQueryParser.parse(
@@ -516,42 +531,39 @@ actual fun PlatformMapView(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        val refreshVisibleFavoriteMarkers: () -> Unit = {
+            val focusedPlaces = favoriteFolders
+                .firstOrNull { it.id == selectedFavoriteFolderId }
+                ?.places
+                .orEmpty()
+            mapLibreMap?.let { map ->
+                favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, focusedPlaces)
+            }
+        }
+
+        val openPlaceCollectionsDialog: (PhotonSearchResult, String?) -> Unit = { place, preselectedFolderId ->
+            val existingFolderIds = favoriteFolders.folderIdsContainingPlace(place)
+            selectedSearchResult = place
+            searchQuery = place.title
+            placeFolderDraftIds = existingFolderIds + listOfNotNull(preselectedFolderId)
+            showPlaceCollectionsDialog = true
+        }
+
         val selectSearchResult: (PhotonSearchResult) -> Unit = { result ->
             val pendingFolderId = pendingAddToFavoriteFolderId
-            if (pendingFolderId != null) {
-                favoriteFolders = context.addPlaceToFavoriteFolder(
-                    folderId = pendingFolderId,
-                    place = result,
-                    current = favoriteFolders,
-                )
-                selectedFavoriteFolderId = pendingFolderId
-                pendingAddToFavoriteFolderId = null
-                isSearchPageOpen = false
-                searchResults = emptyList()
-                searchError = null
+            pendingAddToFavoriteFolderId = null
+            pendingPreferredCollectionFolderId = pendingFolderId
+            showPlaceDetailPanel = false
+            isSearchPageOpen = false
+            searchResults = emptyList()
+            searchError = null
+            selectedSearchResult = result
 
-                val updatedPlaces = favoriteFolders
-                    .firstOrNull { it.id == pendingFolderId }
-                    ?.places
-                    .orEmpty()
-
-                mapLibreMap?.let { map ->
-                    favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, updatedPlaces)
-                    map.focusOnPlaces(updatedPlaces)
-                }
-                activeTab = BottomNavTab.Map
-            } else {
-                selectedSearchResult = result
-                searchQuery = result.title
-                isSearchPageOpen = false
-                searchResults = emptyList()
-                searchError = null
-
-                mapLibreMap?.let { map ->
-                    searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, result)
-                    map.focusOnSearchResult(result.latLng)
-                }
+            mapLibreMap?.let { map ->
+                searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, result)
+                map.focusOnSearchResult(result.latLng)
             }
+            activeTab = BottomNavTab.Map
         }
 
         val reminderCardModifier = Modifier
@@ -596,6 +608,16 @@ actual fun PlatformMapView(
                 if (currentMap == null) {
                     view.getMapAsync { asyncMap ->
                         mapLibreMap = asyncMap
+                        asyncMap.setOnMarkerClickListener { marker ->
+                            val place = marker.toPhotonSearchResultOrNull() ?: return@setOnMarkerClickListener false
+                            selectedSearchResult = place
+                            pendingPreferredCollectionFolderId = null
+                            showPlaceDetailPanel = true
+                            searchedLocationMarker = asyncMap.updateSearchMarker(searchedLocationMarker, place)
+                            asyncMap.focusOnSearchResult(place.latLng)
+                            activeTab = BottomNavTab.Map
+                            true
+                        }
                         if (loadedStyleUrl != config.styleUrl) {
                             applyStyleAndSync(asyncMap)
                         } else {
@@ -622,6 +644,8 @@ actual fun PlatformMapView(
         if (!isSearchPageOpen && activeTab == BottomNavTab.Map) {
             Card(modifier = searchCardModifier.clickable {
                 pendingAddToFavoriteFolderId = null
+                pendingPreferredCollectionFolderId = null
+                showPlaceDetailPanel = false
                 isSearchPageOpen = true
             }) {
             Row(
@@ -643,6 +667,10 @@ actual fun PlatformMapView(
                             searchError = null
                             searchResults = emptyList()
                             selectedSearchResult = null
+                            pendingPreferredCollectionFolderId = null
+                            showPlaceDetailPanel = false
+                            showPlaceCollectionsDialog = false
+                            placeFolderDraftIds = emptySet()
                             searchedLocationMarker = mapLibreMap?.updateSearchMarker(
                                 searchedLocationMarker,
                                 null,
@@ -716,16 +744,18 @@ actual fun PlatformMapView(
         }
 
         if (!isSearchPageOpen) {
-            FloatingActionButton(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .zIndex(3f)
-                    .padding(end = 16.dp, bottom = bottomBarHeight + 16.dp),
-                onClick = {
-                    locateUser(true)
-                },
-            ) {
-                Text("定位")
+            if (!showPlaceDetailPanel) {
+                FloatingActionButton(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .zIndex(3f)
+                        .padding(end = 16.dp, bottom = bottomBarHeight + 16.dp),
+                    onClick = {
+                        locateUser(true)
+                    },
+                ) {
+                    Text("定位")
+                }
             }
 
             BottomSheetScaffold(
@@ -805,7 +835,11 @@ actual fun PlatformMapView(
                                                 onClick = {
                                                     selectedFavoriteFolderId = folder.id
                                                     pendingAddToFavoriteFolderId = null
+                                                    pendingPreferredCollectionFolderId = null
                                                     selectedSearchResult = null
+                                                    showPlaceDetailPanel = false
+                                                    showPlaceCollectionsDialog = false
+                                                    placeFolderDraftIds = emptySet()
                                                     searchedLocationMarker = mapLibreMap?.updateSearchMarker(
                                                         searchedLocationMarker,
                                                         null,
@@ -886,6 +920,116 @@ actual fun PlatformMapView(
                         )
                     },
                     label = { Text("列表") },
+                )
+            }
+        }
+
+        if (!isSearchPageOpen && activeTab == BottomNavTab.Map && showPlaceDetailPanel) {
+            selectedSearchResult?.let { place ->
+                Card(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .zIndex(4f)
+                        .padding(start = 12.dp, end = 12.dp, bottom = bottomBarHeight + 12.dp),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = place.title,
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                                place.subtitle?.let {
+                                    Text(
+                                        text = it,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { showPlaceDetailPanel = false }) {
+                                Icon(
+                                    painter = painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
+                                    contentDescription = "关闭地点面板",
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = "${"%.6f".format(Locale.US, place.latLng.latitude)}, ${"%.6f".format(Locale.US, place.latLng.longitude)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            FilledTonalButton(
+                                onClick = {
+                                    showPlaceDetailPanel = false
+                                    openPlaceCollectionsDialog(place, pendingPreferredCollectionFolderId)
+                                    pendingPreferredCollectionFolderId = null
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("收藏")
+                            }
+                            OutlinedButton(
+                                onClick = { placeActionHint = "路径功能即将上线" },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("路径")
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = { placeActionHint = "AI 查询功能即将上线" },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("AI 查询")
+                            }
+                            OutlinedButton(
+                                onClick = { placeActionHint = "分享功能即将上线" },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("分享")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val quickHint = placeActionHint
+        if (!isSearchPageOpen && quickHint != null) {
+            Card(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 82.dp, start = 16.dp, end = 16.dp)
+                    .zIndex(5f),
+            ) {
+                Text(
+                    text = quickHint,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                 )
             }
         }
@@ -1098,6 +1242,111 @@ actual fun PlatformMapView(
             )
         }
 
+        val editablePlace = selectedSearchResult
+        if (showPlaceCollectionsDialog && editablePlace != null) {
+            AlertDialog(
+                onDismissRequest = { showPlaceCollectionsDialog = false },
+                title = { Text("地点收藏") },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = editablePlace.title,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        editablePlace.subtitle?.let {
+                            Text(
+                                text = it,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+
+                        Text(
+                            text = "已选择 ${placeFolderDraftIds.size} 个收藏夹",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        if (favoriteFolders.isEmpty()) {
+                            Text(
+                                text = "暂无收藏夹，请先在列表页新建收藏夹",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        } else {
+                            favoriteFolders.forEach { folder ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(
+                                            color = if (folder.id in placeFolderDraftIds) {
+                                                MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f)
+                                            } else {
+                                                Color.Transparent
+                                            },
+                                            shape = RoundedCornerShape(12.dp),
+                                        )
+                                        .clickable {
+                                            placeFolderDraftIds = if (folder.id in placeFolderDraftIds) {
+                                                placeFolderDraftIds - folder.id
+                                            } else {
+                                                placeFolderDraftIds + folder.id
+                                            }
+                                        }
+                                        .padding(vertical = 4.dp, horizontal = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Checkbox(
+                                        checked = folder.id in placeFolderDraftIds,
+                                        onCheckedChange = null,
+                                    )
+                                    Column(modifier = Modifier.padding(start = 2.dp)) {
+                                        Text(folder.name, style = MaterialTheme.typography.bodyLarge)
+                                        Text(
+                                            text = "${folder.places.size} 个地点",
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            favoriteFolders = context.setPlaceFolderMembership(
+                                place = editablePlace,
+                                targetFolderIds = placeFolderDraftIds,
+                                current = favoriteFolders,
+                            )
+
+                            if (selectedFavoriteFolderId == null && placeFolderDraftIds.isNotEmpty()) {
+                                selectedFavoriteFolderId = favoriteFolders
+                                    .firstOrNull { it.id in placeFolderDraftIds }
+                                    ?.id
+                            }
+
+                            refreshVisibleFavoriteMarkers()
+                            showPlaceCollectionsDialog = false
+                        },
+                    ) {
+                        Text("保存")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showPlaceCollectionsDialog = false }) {
+                        Text("取消")
+                    }
+                },
+            )
+        }
+
         pendingDeleteFavoriteFolder?.let { target ->
             AlertDialog(
                 onDismissRequest = { pendingDeleteFavoriteFolder = null },
@@ -1277,6 +1526,16 @@ private fun Marker.matches(place: PhotonSearchResult): Boolean {
     return hasSameLatLng(position, place.latLng) &&
         title == place.title &&
         snippet.orEmpty() == (place.subtitle ?: "")
+}
+
+private fun Marker.toPhotonSearchResultOrNull(): PhotonSearchResult? {
+    val markerTitle = title?.takeIf { it.isNotBlank() } ?: return null
+    if (markerTitle == "My location") return null
+    return PhotonSearchResult(
+        title = markerTitle,
+        subtitle = snippet?.takeIf { it.isNotBlank() },
+        latLng = position,
+    )
 }
 
 private fun hasSameLatLng(first: LatLng, second: LatLng, epsilon: Double = 1e-6): Boolean {
@@ -1473,17 +1732,33 @@ private fun Context.saveFavoriteFolders(folders: List<FavoriteFolder>): List<Fav
     return updated
 }
 
-private fun Context.addPlaceToFavoriteFolder(
-    folderId: String,
+
+private fun List<FavoriteFolder>.folderIdsContainingPlace(place: PhotonSearchResult): Set<String> {
+    val placeKey = place.toStableKey()
+    return asSequence()
+        .filter { folder -> folder.places.any { it.toStableKey() == placeKey } }
+        .map { it.id }
+        .toSet()
+}
+
+private fun Context.setPlaceFolderMembership(
     place: PhotonSearchResult,
+    targetFolderIds: Set<String>,
     current: List<FavoriteFolder>,
 ): List<FavoriteFolder> {
+    val placeKey = place.toStableKey()
     val updated = current.map { folder ->
-        if (folder.id != folderId) return@map folder
-        val nextPlaces = (folder.places + place)
-            .distinctBy { "${it.title}:${it.latLng.latitude}:${it.latLng.longitude}" }
-            .take(MAX_FAVORITE_PLACES_PER_FOLDER)
-        folder.copy(places = nextPlaces)
+        val containsPlace = folder.places.any { it.toStableKey() == placeKey }
+        val shouldContainPlace = folder.id in targetFolderIds
+        when {
+            shouldContainPlace && !containsPlace -> {
+                folder.copy(places = (folder.places + place).take(MAX_FAVORITE_PLACES_PER_FOLDER))
+            }
+            !shouldContainPlace && containsPlace -> {
+                folder.copy(places = folder.places.filterNot { it.toStableKey() == placeKey })
+            }
+            else -> folder
+        }
     }
     return saveFavoriteFolders(updated)
 }
