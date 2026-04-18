@@ -3,6 +3,8 @@ package com.zhijie.aura
 import android.Manifest
 import android.app.Activity
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -138,6 +140,11 @@ private enum class ListPeekMode {
     Tiny,
 }
 
+private enum class HintTone {
+    Neutral,
+    Success,
+}
+
 private data class PhotonSearchResult(
     val title: String,
     val subtitle: String?,
@@ -188,9 +195,11 @@ actual fun PlatformMapView(
     var pendingAddToFavoriteFolderId by remember { mutableStateOf<String?>(null) }
     var pendingPreferredCollectionFolderId by remember { mutableStateOf<String?>(null) }
     var showPlaceDetailPanel by remember { mutableStateOf(false) }
+    var showPlaceActionExtras by remember { mutableStateOf(false) }
     var showPlaceCollectionsDialog by remember { mutableStateOf(false) }
     var placeFolderDraftIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var placeActionHint by remember { mutableStateOf<String?>(null) }
+    var placeActionHintTone by remember { mutableStateOf(HintTone.Neutral) }
     var showCreateFavoriteDialog by remember { mutableStateOf(false) }
     var newFavoriteName by remember { mutableStateOf("") }
     var createFavoriteError by remember { mutableStateOf<String?>(null) }
@@ -388,6 +397,7 @@ actual fun PlatformMapView(
         if (placeActionHint != null) {
             delay(1800)
             placeActionHint = null
+            placeActionHintTone = HintTone.Neutral
         }
     }
 
@@ -531,6 +541,11 @@ actual fun PlatformMapView(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        val showHint: (String, HintTone) -> Unit = { message, tone ->
+            placeActionHint = message
+            placeActionHintTone = tone
+        }
+
         val refreshVisibleFavoriteMarkers: () -> Unit = {
             val focusedPlaces = favoriteFolders
                 .firstOrNull { it.id == selectedFavoriteFolderId }
@@ -554,6 +569,7 @@ actual fun PlatformMapView(
             pendingAddToFavoriteFolderId = null
             pendingPreferredCollectionFolderId = pendingFolderId
             showPlaceDetailPanel = false
+            showPlaceActionExtras = false
             isSearchPageOpen = false
             searchResults = emptyList()
             searchError = null
@@ -613,6 +629,7 @@ actual fun PlatformMapView(
                             selectedSearchResult = place
                             pendingPreferredCollectionFolderId = null
                             showPlaceDetailPanel = true
+                            showPlaceActionExtras = false
                             searchedLocationMarker = asyncMap.updateSearchMarker(searchedLocationMarker, place)
                             asyncMap.focusOnSearchResult(place.latLng)
                             activeTab = BottomNavTab.Map
@@ -641,11 +658,29 @@ actual fun PlatformMapView(
             )
         }
 
+        if (!isSearchPageOpen && activeTab == BottomNavTab.Map && showPlaceDetailPanel) {
+            BackHandler {
+                showPlaceDetailPanel = false
+                showPlaceActionExtras = false
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.18f))
+                    .clickable {
+                        showPlaceDetailPanel = false
+                        showPlaceActionExtras = false
+                    }
+                    .zIndex(3f),
+            )
+        }
+
         if (!isSearchPageOpen && activeTab == BottomNavTab.Map) {
             Card(modifier = searchCardModifier.clickable {
                 pendingAddToFavoriteFolderId = null
                 pendingPreferredCollectionFolderId = null
                 showPlaceDetailPanel = false
+                showPlaceActionExtras = false
                 isSearchPageOpen = true
             }) {
             Row(
@@ -669,6 +704,7 @@ actual fun PlatformMapView(
                             selectedSearchResult = null
                             pendingPreferredCollectionFolderId = null
                             showPlaceDetailPanel = false
+                            showPlaceActionExtras = false
                             showPlaceCollectionsDialog = false
                             placeFolderDraftIds = emptySet()
                             searchedLocationMarker = mapLibreMap?.updateSearchMarker(
@@ -838,6 +874,7 @@ actual fun PlatformMapView(
                                                     pendingPreferredCollectionFolderId = null
                                                     selectedSearchResult = null
                                                     showPlaceDetailPanel = false
+                                                    showPlaceActionExtras = false
                                                     showPlaceCollectionsDialog = false
                                                     placeFolderDraftIds = emptySet()
                                                     searchedLocationMarker = mapLibreMap?.updateSearchMarker(
@@ -926,6 +963,7 @@ actual fun PlatformMapView(
 
         if (!isSearchPageOpen && activeTab == BottomNavTab.Map && showPlaceDetailPanel) {
             selectedSearchResult?.let { place ->
+                val collectedFolderCount = favoriteFolders.folderIdsContainingPlace(place).size
                 Card(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -947,6 +985,11 @@ actual fun PlatformMapView(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
+                                    text = "地点详情",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Text(
                                     text = place.title,
                                     style = MaterialTheme.typography.titleMedium,
                                 )
@@ -957,7 +1000,10 @@ actual fun PlatformMapView(
                                     )
                                 }
                             }
-                            IconButton(onClick = { showPlaceDetailPanel = false }) {
+                            IconButton(onClick = {
+                                showPlaceDetailPanel = false
+                                showPlaceActionExtras = false
+                            }) {
                                 Icon(
                                     painter = painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
                                     contentDescription = "关闭地点面板",
@@ -971,6 +1017,16 @@ actual fun PlatformMapView(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
 
+                        Text(
+                            text = if (collectedFolderCount > 0) {
+                                "已加入 $collectedFolderCount 个收藏夹"
+                            } else {
+                                "尚未加入收藏夹"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
                         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
                         Row(
@@ -980,6 +1036,7 @@ actual fun PlatformMapView(
                             FilledTonalButton(
                                 onClick = {
                                     showPlaceDetailPanel = false
+                                    showPlaceActionExtras = false
                                     openPlaceCollectionsDialog(place, pendingPreferredCollectionFolderId)
                                     pendingPreferredCollectionFolderId = null
                                 },
@@ -988,28 +1045,65 @@ actual fun PlatformMapView(
                                 Text("收藏")
                             }
                             OutlinedButton(
-                                onClick = { placeActionHint = "路径功能即将上线" },
+                                onClick = { showHint("路径功能即将上线", HintTone.Neutral) },
                                 modifier = Modifier.weight(1f),
                             ) {
                                 Text("路径")
                             }
                         }
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        TextButton(
+                            onClick = { showPlaceActionExtras = !showPlaceActionExtras },
+                            modifier = Modifier.align(Alignment.End),
                         ) {
-                            OutlinedButton(
-                                onClick = { placeActionHint = "AI 查询功能即将上线" },
-                                modifier = Modifier.weight(1f),
+                            Text(if (showPlaceActionExtras) "收起更多功能" else "更多功能")
+                        }
+
+                        if (showPlaceActionExtras) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Text("AI 查询")
+                                OutlinedButton(
+                                    onClick = { showHint("AI 查询功能即将上线", HintTone.Neutral) },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("AI 查询")
+                                }
+                                OutlinedButton(
+                                    onClick = { showHint("分享功能即将上线", HintTone.Neutral) },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("分享")
+                                }
                             }
-                            OutlinedButton(
-                                onClick = { placeActionHint = "分享功能即将上线" },
-                                modifier = Modifier.weight(1f),
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Text("分享")
+                                OutlinedButton(
+                                    onClick = {
+                                        val copied = context.copyToClipboard(
+                                            label = "坐标",
+                                            text = "${"%.6f".format(Locale.US, place.latLng.latitude)}, ${"%.6f".format(Locale.US, place.latLng.longitude)}",
+                                        )
+                                        if (copied) {
+                                            showHint("坐标已复制", HintTone.Success)
+                                        } else {
+                                            showHint("暂时无法复制坐标", HintTone.Neutral)
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("复制坐标")
+                                }
+                                OutlinedButton(
+                                    onClick = { showHint("反馈功能即将上线", HintTone.Neutral) },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text("反馈")
+                                }
                             }
                         }
                     }
@@ -1029,6 +1123,11 @@ actual fun PlatformMapView(
                 Text(
                     text = quickHint,
                     style = MaterialTheme.typography.bodyMedium,
+                    color = if (placeActionHintTone == HintTone.Success) {
+                        MaterialTheme.colorScheme.tertiary
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                 )
             }
@@ -1244,6 +1343,7 @@ actual fun PlatformMapView(
 
         val editablePlace = selectedSearchResult
         if (showPlaceCollectionsDialog && editablePlace != null) {
+            BackHandler { showPlaceCollectionsDialog = false }
             AlertDialog(
                 onDismissRequest = { showPlaceCollectionsDialog = false },
                 title = { Text("地点收藏") },
@@ -1279,6 +1379,18 @@ actual fun PlatformMapView(
                                 modifier = Modifier.padding(top = 8.dp),
                             )
                         } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                            ) {
+                                TextButton(onClick = { placeFolderDraftIds = favoriteFolders.map { it.id }.toSet() }) {
+                                    Text("全选")
+                                }
+                                TextButton(onClick = { placeFolderDraftIds = emptySet() }) {
+                                    Text("清空")
+                                }
+                            }
+
                             favoriteFolders.forEach { folder ->
                                 Row(
                                     modifier = Modifier
@@ -1333,6 +1445,7 @@ actual fun PlatformMapView(
                             }
 
                             refreshVisibleFavoriteMarkers()
+                            showHint("收藏夹已更新", HintTone.Success)
                             showPlaceCollectionsDialog = false
                         },
                     ) {
@@ -1865,6 +1978,12 @@ private fun Context.openLocationSettings() {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     startActivity(intent)
+}
+
+private fun Context.copyToClipboard(label: String, text: String): Boolean {
+    val clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
+    clipboardManager.setPrimaryClip(ClipData.newPlainText(label, text))
+    return true
 }
 
 @SuppressLint("MissingPermission")
