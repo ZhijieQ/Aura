@@ -13,6 +13,8 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.PointF
+import android.graphics.RectF
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -113,6 +115,7 @@ import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.Style
 import org.maplibre.android.maps.MapView
+import org.maplibre.geojson.Feature
 import com.zhijie.aura.search.SemanticQueryParser
 import com.zhijie.aura.search.SemanticTag
 import org.json.JSONArray
@@ -626,6 +629,21 @@ actual fun PlatformMapView(
                         mapLibreMap = asyncMap
                         asyncMap.setOnMarkerClickListener { marker ->
                             val place = marker.toPhotonSearchResultOrNull() ?: return@setOnMarkerClickListener false
+                            selectedSearchResult = place
+                            pendingPreferredCollectionFolderId = null
+                            showPlaceDetailPanel = true
+                            showPlaceActionExtras = false
+                            searchedLocationMarker = asyncMap.updateSearchMarker(searchedLocationMarker, place)
+                            asyncMap.focusOnSearchResult(place.latLng)
+                            activeTab = BottomNavTab.Map
+                            true
+                        }
+                        asyncMap.addOnMapClickListener { clickedLatLng ->
+                            if (isSearchPageOpen) {
+                                return@addOnMapClickListener false
+                            }
+
+                            val place = asyncMap.pickBaseMapPlace(clickedLatLng) ?: return@addOnMapClickListener false
                             selectedSearchResult = place
                             pendingPreferredCollectionFolderId = null
                             showPlaceDetailPanel = true
@@ -1655,6 +1673,217 @@ private fun hasSameLatLng(first: LatLng, second: LatLng, epsilon: Double = 1e-6)
     return kotlin.math.abs(first.latitude - second.latitude) <= epsilon &&
         kotlin.math.abs(first.longitude - second.longitude) <= epsilon
 }
+
+private fun MapLibreMap.pickBaseMapPlace(clickedLatLng: LatLng): PhotonSearchResult? {
+    // Limit click-to-select to mid/high zoom to avoid selecting broad region labels.
+    if (cameraPosition.zoom < BASE_MAP_PICK_MIN_ZOOM) return null
+
+    val clickPoint: PointF = projection.toScreenLocation(clickedLatLng)
+    val pickRadiusPx = BASE_MAP_PICK_RADIUS_PX
+    val clickRect = RectF(
+        clickPoint.x - pickRadiusPx,
+        clickPoint.y - pickRadiusPx,
+        clickPoint.x + pickRadiusPx,
+        clickPoint.y + pickRadiusPx,
+    )
+    val features = runCatching { queryRenderedFeatures(clickRect) }
+        .getOrElse { runCatching { queryRenderedFeatures(clickPoint) }.getOrDefault(emptyList()) }
+
+    return features
+        .asSequence()
+        .mapNotNull { feature ->
+            val place = feature.toBaseMapPlaceOrNull(clickedLatLng) ?: return@mapNotNull null
+            val score = feature.poiPickScore()
+            place to score
+        }
+        .maxByOrNull { it.second }
+        ?.first
+}
+
+private fun Feature.toBaseMapPlaceOrNull(fallbackLatLng: LatLng): PhotonSearchResult? {
+    val name = bestDisplayName()
+
+    val placeClass = getStringPropertySafely("class")?.trim().orEmpty()
+    val placeType = getStringPropertySafely("type")?.trim().orEmpty()
+
+    val normalizedClass = placeClass.lowercase(Locale.ROOT)
+    val normalizedType = placeType.lowercase(Locale.ROOT)
+
+    val hasNamedPlace = !name.isNullOrBlank()
+    if (!hasNamedPlace) {
+        return null
+    }
+
+    if (normalizedClass in NON_PLACE_FEATURE_CLASSES || normalizedType in NON_PLACE_FEATURE_TYPES) {
+        return null
+    }
+
+    val title = name
+
+    val subtitle = listOf(
+        placeClass.takeIf { it.isNotBlank() }?.toPlaceTypeLabel(),
+        placeType.takeIf { it.isNotBlank() }?.toPlaceTypeLabel(),
+        getStringPropertySafely("street"),
+        getStringPropertySafely("city"),
+        getStringPropertySafely("state"),
+        getStringPropertySafely("country"),
+    ).filterNotNull()
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+        .joinToString(" · ")
+        .ifBlank { null }
+
+    return PhotonSearchResult(
+        title = title,
+        subtitle = subtitle,
+        latLng = fallbackLatLng,
+    )
+}
+
+private fun Feature.getStringPropertySafely(key: String): String? {
+    if (!hasProperty(key)) return null
+    return runCatching { getStringProperty(key) }
+        .getOrNull()
+        ?.takeIf { it.isNotBlank() }
+}
+
+private fun Feature.bestDisplayName(): String? {
+    val directNameKeys = listOf(
+        "name",
+        "name:zh",
+        "name:en",
+        "name:es",
+        "name_es",
+        "int_name",
+        "official_name",
+        "short_name",
+        "loc_name",
+    )
+
+    val directMatch = directNameKeys
+        .asSequence()
+        .mapNotNull { key -> getStringPropertySafely(key) }
+        .firstOrNull { it.isNotBlank() }
+    if (!directMatch.isNullOrBlank()) return directMatch
+
+    // Some vector tiles expose only localized keys like name:xx.
+    val dynamicLocalizedName = runCatching {
+        properties()
+            ?.entrySet()
+            ?.asSequence()
+            ?.firstOrNull { (key, value) ->
+                key.startsWith("name:") && value != null && value.isJsonPrimitive && value.asJsonPrimitive.isString
+            }
+            ?.value
+            ?.asString
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    return dynamicLocalizedName
+}
+
+private fun Feature.hasAnyProperty(vararg keys: String): Boolean {
+    return keys.any { key ->
+        getStringPropertySafely(key)?.isNotBlank() == true
+    }
+}
+
+private fun Feature.poiPickScore(): Int {
+    val placeClass = getStringPropertySafely("class")?.trim()?.lowercase(Locale.ROOT).orEmpty()
+    val placeType = getStringPropertySafely("type")?.trim()?.lowercase(Locale.ROOT).orEmpty()
+    val hasName = !bestDisplayName().isNullOrBlank()
+
+    var score = 0
+    if (hasName) score += 120
+    if (hasAnyProperty("maki", "category")) score += 120
+    if (placeClass in POI_BUILDING_CLASSES) score += 70
+    if (placeType in POI_BUILDING_TYPES) score += 50
+    if (hasAnyProperty("street", "city", "state", "country")) score += 12
+    return score
+}
+
+private fun String.toPlaceTypeLabel(): String {
+    return replace('_', ' ')
+        .replace('-', ' ')
+        .trim()
+        .replaceFirstChar { ch ->
+            if (ch.isLowerCase()) ch.titlecase(Locale.getDefault()) else ch.toString()
+        }
+}
+
+private val NON_PLACE_FEATURE_CLASSES = setOf(
+    "boundary",
+    "landcover",
+    "landuse",
+    "mountain_peak",
+    "path",
+    "rail",
+    "road",
+    "transit",
+    "water",
+    "water_name",
+)
+
+private val NON_PLACE_FEATURE_TYPES = setOf(
+    "archipelago",
+    "city",
+    "country",
+    "county",
+    "district",
+    "hamlet",
+    "locality",
+    "neighbourhood",
+    "province",
+    "region",
+    "state",
+    "suburb",
+    "town",
+    "village",
+)
+
+private val POI_BUILDING_CLASSES = setOf(
+    "aeroway",
+    "amenity",
+    "building",
+    "historic",
+    "leisure",
+    "man_made",
+    "office",
+    "shop",
+    "tourism",
+)
+
+private val POI_BUILDING_TYPES = setOf(
+    "apartments",
+    "attraction",
+    "castle",
+    "church",
+    "commercial",
+    "construction",
+    "gallery",
+    "government",
+    "hospital",
+    "hotel",
+    "mall",
+    "memorial",
+    "monument",
+    "museum",
+    "office",
+    "public",
+    "residential",
+    "retail",
+    "school",
+    "stadium",
+    "station",
+    "temple",
+    "theatre",
+    "tower",
+    "university",
+)
+
+private const val BASE_MAP_PICK_MIN_ZOOM = 12.8
+private const val BASE_MAP_PICK_RADIUS_PX = 20f
 
 private suspend fun searchPhoton(
     query: String,
