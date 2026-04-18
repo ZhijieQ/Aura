@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
 import android.graphics.Paint
 import android.graphics.PointF
 import android.graphics.RectF
@@ -108,6 +109,8 @@ import org.maplibre.android.annotations.Icon as MapLibreIcon
 import org.maplibre.android.annotations.IconFactory
 import org.maplibre.android.annotations.Marker
 import org.maplibre.android.annotations.MarkerOptions
+import org.maplibre.android.annotations.Polyline
+import org.maplibre.android.annotations.PolylineOptions
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -124,6 +127,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import kotlin.math.pow
 import kotlin.math.roundToLong
 
 private enum class LocationPermissionState {
@@ -148,6 +152,12 @@ private enum class HintTone {
     Success,
 }
 
+private enum class RouteProfile(val costing: String, val label: String) {
+    Drive(costing = "auto", label = "驾车"),
+    Walk(costing = "pedestrian", label = "步行"),
+    Bike(costing = "bicycle", label = "骑行"),
+}
+
 private data class PhotonSearchResult(
     val title: String,
     val subtitle: String?,
@@ -158,6 +168,13 @@ private data class FavoriteFolder(
     val id: String,
     val name: String,
     val places: List<PhotonSearchResult>,
+)
+
+private data class RouteResult(
+    val profile: RouteProfile,
+    val shape: List<LatLng>,
+    val distanceKm: Double,
+    val durationSeconds: Double,
 )
 
 @Composable
@@ -182,6 +199,7 @@ actual fun PlatformMapView(
     var userLocationMarker by remember { mutableStateOf<Marker?>(null) }
     var searchedLocationMarker by remember { mutableStateOf<Marker?>(null) }
     var favoriteMarkers by remember { mutableStateOf<List<Marker>>(emptyList()) }
+    var routePolyline by remember { mutableStateOf<Polyline?>(null) }
     var loadedStyleUrl by remember { mutableStateOf<String?>(null) }
     var isLocationServiceEnabled by remember { mutableStateOf(context.isLocationServiceEnabled()) }
     var showPermissionCard by remember { mutableStateOf(false) }
@@ -208,6 +226,13 @@ actual fun PlatformMapView(
     var createFavoriteError by remember { mutableStateOf<String?>(null) }
     var pendingDeleteFavoriteFolder by remember { mutableStateOf<FavoriteFolder?>(null) }
     var selectedSearchResult by remember { mutableStateOf<PhotonSearchResult?>(null) }
+    var routeDestination by remember { mutableStateOf<PhotonSearchResult?>(null) }
+    var routeProfile by remember { mutableStateOf(RouteProfile.Drive) }
+    var routeResult by remember { mutableStateOf<RouteResult?>(null) }
+    var routeError by remember { mutableStateOf<String?>(null) }
+    var isRouting by remember { mutableStateOf(false) }
+    var isRoutePanelOpen by remember { mutableStateOf(false) }
+    var routeRequestToken by remember { mutableStateOf(0) }
     var immediateSearchToken by remember { mutableStateOf(0) }
     var activeTab by remember { mutableStateOf(BottomNavTab.Map) }
     var listPeekMode by remember { mutableStateOf(ListPeekMode.Full) }
@@ -404,6 +429,37 @@ actual fun PlatformMapView(
         }
     }
 
+    LaunchedEffect(routeRequestToken, routeDestination, routeProfile, isRoutePanelOpen) {
+        if (!isRoutePanelOpen || routeRequestToken == 0) return@LaunchedEffect
+        val destination = routeDestination ?: return@LaunchedEffect
+        val map = mapLibreMap ?: return@LaunchedEffect
+        val origin = userLocation ?: map.cameraPosition.target
+        if (origin == null) {
+            routeError = "暂时无法获取起点"
+            isRouting = false
+            return@LaunchedEffect
+        }
+
+        isRouting = true
+        routeError = null
+        runCatching {
+            requestServerRoute(
+                origin = origin,
+                destination = destination.latLng,
+                profile = routeProfile,
+            )
+        }.onSuccess { route ->
+            routeResult = route
+            routePolyline = map.updateRoutePolyline(routePolyline, route.shape)
+            map.focusOnRoute(route.shape)
+        }.onFailure {
+            routeResult = null
+            routeError = "路径规划失败，请稍后重试"
+            routePolyline = map.updateRoutePolyline(routePolyline, null)
+        }
+        isRouting = false
+    }
+
     suspend fun runSearch(query: String) {
         val biasCenter = userLocation ?: mapLibreMap?.cameraPosition?.target
         val parsed = SemanticQueryParser.parse(
@@ -567,6 +623,15 @@ actual fun PlatformMapView(
             showPlaceCollectionsDialog = true
         }
 
+        val clearRoute: () -> Unit = {
+            routeResult = null
+            routeError = null
+            isRouting = false
+            routeRequestToken = 0
+            routePolyline = mapLibreMap?.updateRoutePolyline(routePolyline, null)
+            isRoutePanelOpen = false
+        }
+
         val selectSearchResult: (PhotonSearchResult) -> Unit = { result ->
             val pendingFolderId = pendingAddToFavoriteFolderId
             pendingAddToFavoriteFolderId = null
@@ -600,6 +665,7 @@ actual fun PlatformMapView(
             userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
             searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
             favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, selectedFavoritePlaces)
+            routePolyline = map.updateRoutePolyline(routePolyline, routeResult?.shape)
 
             val currentLocation = userLocation
             if (currentLocation != null && !hasCenteredOnUserLocation) {
@@ -1063,7 +1129,18 @@ actual fun PlatformMapView(
                                 Text("收藏")
                             }
                             OutlinedButton(
-                                onClick = { showHint("路径功能即将上线", HintTone.Neutral) },
+                                onClick = {
+                                    if (userLocation == null) {
+                                        locateUser(false)
+                                    }
+                                    routeDestination = place
+                                    routeError = null
+                                    routeResult = null
+                                    showPlaceActionExtras = false
+                                    showPlaceDetailPanel = false
+                                    isRoutePanelOpen = true
+                                    routeRequestToken += 1
+                                },
                                 modifier = Modifier.weight(1f),
                             ) {
                                 Text("路径")
@@ -1123,6 +1200,124 @@ actual fun PlatformMapView(
                                     Text("反馈")
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!isSearchPageOpen && activeTab == BottomNavTab.Map && isRoutePanelOpen) {
+            BackHandler { clearRoute() }
+            val destination = routeDestination
+            Card(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .zIndex(4f)
+                    .padding(start = 12.dp, end = 12.dp, bottom = bottomBarHeight + 12.dp),
+                shape = RoundedCornerShape(24.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "路线规划",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            Text(
+                                text = destination?.title ?: "未选择终点",
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            Text(
+                                text = if (userLocation != null) "起点：我的位置" else "起点：地图中心",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        IconButton(onClick = { clearRoute() }) {
+                            Icon(
+                                painter = painterResource(id = android.R.drawable.ic_menu_close_clear_cancel),
+                                contentDescription = "关闭路线面板",
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        RouteProfile.entries.forEach { profile ->
+                            val selected = routeProfile == profile
+                            if (selected) {
+                                FilledTonalButton(
+                                    onClick = { },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text(profile.label)
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = {
+                                        routeProfile = profile
+                                        routeRequestToken += 1
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text(profile.label)
+                                }
+                            }
+                        }
+                    }
+
+                    when {
+                        isRouting -> {
+                            Text(
+                                text = "正在规划路线...",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+
+                        routeError != null -> {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = routeError!!,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                TextButton(onClick = { routeRequestToken += 1 }) {
+                                    Text("重试")
+                                }
+                            }
+                        }
+
+                        routeResult != null -> {
+                            val summary = routeResult!!
+                            Text(
+                                text = "${formatDistance(summary.distanceKm)} | ${formatDuration(summary.durationSeconds)}",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        OutlinedButton(onClick = { clearRoute() }) {
+                            Text("清除路线")
                         }
                     }
                 }
@@ -1542,6 +1737,19 @@ private fun MapLibreMap.focusOnPlaces(places: List<PhotonSearchResult>) {
     animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, 120))
 }
 
+private fun MapLibreMap.focusOnRoute(points: List<LatLng>) {
+    if (points.isEmpty()) return
+    if (points.size == 1) {
+        focusOnSearchResult(points.first())
+        return
+    }
+
+    val boundsBuilder = LatLngBounds.Builder()
+    points.forEach { boundsBuilder.include(it) }
+    val bounds = boundsBuilder.build()
+    animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, 140))
+}
+
 private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: LatLng?, icon: MapLibreIcon): Marker? {
     if (userLatLng == null) {
         currentMarker?.let { removeMarker(it) }
@@ -1626,6 +1834,29 @@ private fun MapLibreMap.updateFavoriteMarkers(
     }
 
     return nextMarkers
+}
+
+private fun MapLibreMap.updateRoutePolyline(currentPolyline: Polyline?, points: List<LatLng>?): Polyline? {
+    if (points.isNullOrEmpty()) {
+        currentPolyline?.let { removePolyline(it) }
+        return null
+    }
+
+    if (
+        currentPolyline != null &&
+            currentPolyline.points.size == points.size &&
+            currentPolyline.points.zip(points).all { (first, second) -> hasSameLatLng(first, second) }
+    ) {
+        return currentPolyline
+    }
+
+    currentPolyline?.let { removePolyline(it) }
+    return addPolyline(
+        PolylineOptions()
+            .addAll(points)
+            .color(AndroidColor.argb(230, 26, 115, 232))
+            .width(8f),
+    )
 }
 
 private data class MarkerStableKey(
@@ -1884,6 +2115,200 @@ private val POI_BUILDING_TYPES = setOf(
 
 private const val BASE_MAP_PICK_MIN_ZOOM = 12.8
 private const val BASE_MAP_PICK_RADIUS_PX = 20f
+
+private suspend fun requestServerRoute(
+    origin: LatLng,
+    destination: LatLng,
+    profile: RouteProfile,
+): RouteResult = withContext(Dispatchers.IO) {
+    val requestUrl = URL("https://osm.zhijie.win/route")
+    val payload = JSONObject().apply {
+        put(
+            "locations",
+            JSONArray().apply {
+                put(
+                    JSONObject().apply {
+                        put("lat", origin.latitude)
+                        put("lon", origin.longitude)
+                    },
+                )
+                put(
+                    JSONObject().apply {
+                        put("lat", destination.latitude)
+                        put("lon", destination.longitude)
+                    },
+                )
+            },
+        )
+        put("costing", profile.costing)
+        put(
+            "directions_options",
+            JSONObject().apply {
+                put("language", "zh-CN")
+                put("units", "kilometers")
+            },
+        )
+    }.toString()
+
+    val connection = (requestUrl.openConnection() as HttpURLConnection).apply {
+        connectTimeout = 10000
+        readTimeout = 10000
+        requestMethod = "POST"
+        doInput = true
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("Accept", "application/json")
+    }
+
+    try {
+        connection.outputStream.bufferedWriter().use { it.write(payload) }
+        val responseCode = connection.responseCode
+        val body = if (responseCode in 200..299) {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } else {
+            connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        }
+
+        if (responseCode !in 200..299) {
+            throw IllegalStateException("HTTP $responseCode: $body")
+        }
+
+        parseRouteResult(body, profile)
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun parseRouteResult(responseBody: String, profile: RouteProfile): RouteResult {
+    val root = JSONObject(responseBody)
+    val trip = root.optJSONObject("trip") ?: throw IllegalStateException("Missing trip")
+    val legs = trip.optJSONArray("legs") ?: throw IllegalStateException("Missing legs")
+
+    val points = mutableListOf<LatLng>()
+    for (index in 0 until legs.length()) {
+        val leg = legs.optJSONObject(index) ?: continue
+        val encodedShape = leg.optString("shape").orEmpty()
+        if (encodedShape.isBlank()) continue
+        val legPoints = decodePolyline(encodedShape, precision = 6)
+        if (legPoints.isEmpty()) continue
+
+        if (points.isNotEmpty() && hasSameLatLng(points.last(), legPoints.first())) {
+            points.addAll(legPoints.drop(1))
+        } else {
+            points.addAll(legPoints)
+        }
+    }
+
+    if (points.isEmpty()) {
+        throw IllegalStateException("Route shape is empty")
+    }
+
+    val tripSummary = trip.optJSONObject("summary")
+    var distanceKm = tripSummary?.optDouble("length", Double.NaN) ?: Double.NaN
+    var durationSeconds = tripSummary?.optDouble("time", Double.NaN) ?: Double.NaN
+
+    if (!distanceKm.isFinite() || !durationSeconds.isFinite()) {
+        var legDistance = 0.0
+        var legDuration = 0.0
+        for (index in 0 until legs.length()) {
+            val legSummary = legs.optJSONObject(index)?.optJSONObject("summary") ?: continue
+            val length = legSummary.optDouble("length", 0.0)
+            val time = legSummary.optDouble("time", 0.0)
+            if (length.isFinite()) legDistance += length
+            if (time.isFinite()) legDuration += time
+        }
+        if (!distanceKm.isFinite()) {
+            distanceKm = if (legDistance > 0.0) legDistance else points.pathDistanceKm()
+        }
+        if (!durationSeconds.isFinite()) {
+            durationSeconds = if (legDuration > 0.0) legDuration else 0.0
+        }
+    }
+
+    return RouteResult(
+        profile = profile,
+        shape = points,
+        distanceKm = distanceKm,
+        durationSeconds = durationSeconds,
+    )
+}
+
+private fun decodePolyline(encoded: String, precision: Int = 6): List<LatLng> {
+    if (encoded.isBlank()) return emptyList()
+
+    val coordinates = mutableListOf<LatLng>()
+    var index = 0
+    var latitude = 0
+    var longitude = 0
+    val factor = 10.0.pow(precision)
+
+    while (index < encoded.length) {
+        var result = 0
+        var shift = 0
+        var b: Int
+        do {
+            b = encoded[index++].code - 63
+            result = result or ((b and 0x1f) shl shift)
+            shift += 5
+        } while (b >= 0x20 && index < encoded.length)
+        val deltaLat = if ((result and 1) != 0) (result shr 1).inv() else (result shr 1)
+        latitude += deltaLat
+
+        result = 0
+        shift = 0
+        do {
+            b = encoded[index++].code - 63
+            result = result or ((b and 0x1f) shl shift)
+            shift += 5
+        } while (b >= 0x20 && index < encoded.length)
+        val deltaLon = if ((result and 1) != 0) (result shr 1).inv() else (result shr 1)
+        longitude += deltaLon
+
+        coordinates += LatLng(latitude / factor, longitude / factor)
+    }
+
+    return coordinates
+}
+
+private fun List<LatLng>.pathDistanceKm(): Double {
+    if (size < 2) return 0.0
+    var meters = 0.0
+    for (index in 1 until size) {
+        val previous = this[index - 1]
+        val current = this[index]
+        val results = FloatArray(1)
+        Location.distanceBetween(
+            previous.latitude,
+            previous.longitude,
+            current.latitude,
+            current.longitude,
+            results,
+        )
+        meters += results[0]
+    }
+    return meters / 1000.0
+}
+
+private fun formatDistance(distanceKm: Double): String {
+    if (!distanceKm.isFinite() || distanceKm <= 0) return "距离未知"
+    return if (distanceKm < 1.0) {
+        "${(distanceKm * 1000).toInt()} 米"
+    } else {
+        String.format(Locale.US, "%.1f 公里", distanceKm)
+    }
+}
+
+private fun formatDuration(durationSeconds: Double): String {
+    if (!durationSeconds.isFinite() || durationSeconds <= 0) return "时间未知"
+    val totalMinutes = (durationSeconds / 60.0).roundToLong().toInt().coerceAtLeast(1)
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return if (hours > 0) {
+        if (minutes > 0) "约 ${hours} 小时 ${minutes} 分" else "约 ${hours} 小时"
+    } else {
+        "约 ${minutes} 分"
+    }
+}
 
 private suspend fun searchPhoton(
     query: String,
