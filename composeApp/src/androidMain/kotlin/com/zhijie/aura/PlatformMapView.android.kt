@@ -74,7 +74,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.material3.Card
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FloatingActionButton
@@ -104,6 +104,7 @@ import org.maplibre.android.annotations.MarkerOptions
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.Style
 import org.maplibre.android.maps.MapView
@@ -115,6 +116,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
+import kotlin.math.roundToLong
 
 private enum class LocationPermissionState {
     Granted,
@@ -139,6 +141,12 @@ private data class PhotonSearchResult(
     val latLng: LatLng,
 )
 
+private data class FavoriteFolder(
+    val id: String,
+    val name: String,
+    val places: List<PhotonSearchResult>,
+)
+
 @Composable
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 actual fun PlatformMapView(
@@ -160,6 +168,7 @@ actual fun PlatformMapView(
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
     var userLocationMarker by remember { mutableStateOf<Marker?>(null) }
     var searchedLocationMarker by remember { mutableStateOf<Marker?>(null) }
+    var favoriteMarkers by remember { mutableStateOf<List<Marker>>(emptyList()) }
     var loadedStyleUrl by remember { mutableStateOf<String?>(null) }
     var isLocationServiceEnabled by remember { mutableStateOf(context.isLocationServiceEnabled()) }
     var showPermissionCard by remember { mutableStateOf(false) }
@@ -171,10 +180,15 @@ actual fun PlatformMapView(
     var isSearching by remember { mutableStateOf(false) }
     var searchError by remember { mutableStateOf<String?>(null) }
     var searchResults by remember { mutableStateOf<List<PhotonSearchResult>>(emptyList()) }
-    var recentSearches by remember { mutableStateOf(context.loadRecentSearches()) }
+    var favoriteFolders by remember { mutableStateOf(context.loadFavoriteFolders()) }
+    var selectedFavoriteFolderId by remember { mutableStateOf<String?>(favoriteFolders.firstOrNull()?.id) }
+    var pendingAddToFavoriteFolderId by remember { mutableStateOf<String?>(null) }
+    var showCreateFavoriteDialog by remember { mutableStateOf(false) }
+    var newFavoriteName by remember { mutableStateOf("") }
+    var createFavoriteError by remember { mutableStateOf<String?>(null) }
+    var pendingDeleteFavoriteFolder by remember { mutableStateOf<FavoriteFolder?>(null) }
     var selectedSearchResult by remember { mutableStateOf<PhotonSearchResult?>(null) }
     var immediateSearchToken by remember { mutableStateOf(0) }
-    var pendingDeleteRecentSearch by remember { mutableStateOf<PhotonSearchResult?>(null) }
     var activeTab by remember { mutableStateOf(BottomNavTab.Map) }
     var listPeekMode by remember { mutableStateOf(ListPeekMode.Full) }
     val bottomBarHeight = 80.dp
@@ -497,18 +511,46 @@ actual fun PlatformMapView(
         }
     }
 
+    val selectedFavoritePlaces = remember(favoriteFolders, selectedFavoriteFolderId) {
+        favoriteFolders.firstOrNull { it.id == selectedFavoriteFolderId }?.places.orEmpty()
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
         val selectSearchResult: (PhotonSearchResult) -> Unit = { result ->
-            selectedSearchResult = result
-            searchQuery = result.title
-            isSearchPageOpen = false
-            searchResults = emptyList()
-            searchError = null
-            recentSearches = context.saveRecentSearch(result, recentSearches)
+            val pendingFolderId = pendingAddToFavoriteFolderId
+            if (pendingFolderId != null) {
+                favoriteFolders = context.addPlaceToFavoriteFolder(
+                    folderId = pendingFolderId,
+                    place = result,
+                    current = favoriteFolders,
+                )
+                selectedFavoriteFolderId = pendingFolderId
+                pendingAddToFavoriteFolderId = null
+                isSearchPageOpen = false
+                searchResults = emptyList()
+                searchError = null
 
-            mapLibreMap?.let { map ->
-                searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, result)
-                map.focusOnSearchResult(result.latLng)
+                val updatedPlaces = favoriteFolders
+                    .firstOrNull { it.id == pendingFolderId }
+                    ?.places
+                    .orEmpty()
+
+                mapLibreMap?.let { map ->
+                    favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, updatedPlaces)
+                    map.focusOnPlaces(updatedPlaces)
+                }
+                activeTab = BottomNavTab.Map
+            } else {
+                selectedSearchResult = result
+                searchQuery = result.title
+                isSearchPageOpen = false
+                searchResults = emptyList()
+                searchError = null
+
+                mapLibreMap?.let { map ->
+                    searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, result)
+                    map.focusOnSearchResult(result.latLng)
+                }
             }
         }
 
@@ -523,36 +565,47 @@ actual fun PlatformMapView(
             .padding(start = 16.dp, end = 16.dp, top = 8.dp)
             .zIndex(2f)
 
+        val syncMapOverlays: (MapLibreMap) -> Unit = { map ->
+            userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
+            searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
+            favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, selectedFavoritePlaces)
+
+            val currentLocation = userLocation
+            if (currentLocation != null && !hasCenteredOnUserLocation) {
+                map.focusOnUser(currentLocation, config.camera.zoom)
+                hasCenteredOnUserLocation = true
+            }
+        }
+
+        val applyStyleAndSync: (MapLibreMap) -> Unit = { map ->
+            loadedStyleUrl = config.styleUrl
+            map.setStyle(Style.Builder().fromUri(config.styleUrl)) {
+                val fallbackTarget = LatLng(config.camera.latitude, config.camera.longitude)
+                val target = userLocation ?: fallbackTarget
+                val zoom = if (userLocation != null) maxOf(config.camera.zoom, 15.0) else config.camera.zoom
+                map.cameraPosition = CameraPosition.Builder().target(target).zoom(zoom).build()
+                syncMapOverlays(map)
+            }
+        }
+
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { mapView },
             update = { view ->
-                view.getMapAsync { map ->
-                    mapLibreMap = map
-
-                    if (loadedStyleUrl != config.styleUrl) {
-                        loadedStyleUrl = config.styleUrl
-                        map.setStyle(Style.Builder().fromUri(config.styleUrl)) {
-                            val fallbackTarget = LatLng(config.camera.latitude, config.camera.longitude)
-                            val target = userLocation ?: fallbackTarget
-                            val zoom = if (userLocation != null) maxOf(config.camera.zoom, 15.0) else config.camera.zoom
-                            map.cameraPosition = CameraPosition.Builder().target(target).zoom(zoom).build()
-                            userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
-                            searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
-                            if (userLocation != null && !hasCenteredOnUserLocation) {
-                                map.focusOnUser(userLocation!!, config.camera.zoom)
-                                hasCenteredOnUserLocation = true
-                            }
-                        }
-                    } else {
-                        userLocationMarker = map.updateUserMarker(userLocationMarker, userLocation, userLocationIcon)
-                        searchedLocationMarker = map.updateSearchMarker(searchedLocationMarker, selectedSearchResult)
-                        val currentLocation = userLocation
-                        if (currentLocation != null && !hasCenteredOnUserLocation) {
-                            map.focusOnUser(currentLocation, config.camera.zoom)
-                            hasCenteredOnUserLocation = true
+                val currentMap = mapLibreMap
+                if (currentMap == null) {
+                    view.getMapAsync { asyncMap ->
+                        mapLibreMap = asyncMap
+                        if (loadedStyleUrl != config.styleUrl) {
+                            applyStyleAndSync(asyncMap)
+                        } else {
+                            syncMapOverlays(asyncMap)
                         }
                     }
+                } else if (loadedStyleUrl != config.styleUrl) {
+                    applyStyleAndSync(currentMap)
+                } else {
+                    syncMapOverlays(currentMap)
                 }
             },
         )
@@ -567,7 +620,10 @@ actual fun PlatformMapView(
         }
 
         if (!isSearchPageOpen && activeTab == BottomNavTab.Map) {
-            Card(modifier = searchCardModifier.clickable { isSearchPageOpen = true }) {
+            Card(modifier = searchCardModifier.clickable {
+                pendingAddToFavoriteFolderId = null
+                isSearchPageOpen = true
+            }) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -717,15 +773,21 @@ actual fun PlatformMapView(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text("您的列表", style = MaterialTheme.typography.titleMedium)
-                            TextButton(onClick = { isSearchPageOpen = true }) {
-                                Text("添加列表")
+                            Text("收藏夹", style = MaterialTheme.typography.titleMedium)
+                            TextButton(
+                                onClick = {
+                                    createFavoriteError = null
+                                    newFavoriteName = ""
+                                    showCreateFavoriteDialog = true
+                                },
+                            ) {
+                                Text("新建")
                             }
                         }
 
-                        if (recentSearches.isEmpty()) {
+                        if (favoriteFolders.isEmpty()) {
                             Text(
-                                text = "暂无列表，点击右上角添加",
+                                text = "暂无收藏夹，点击右上角新建",
                                 style = MaterialTheme.typography.bodyMedium,
                                 modifier = Modifier.padding(vertical = 8.dp),
                             )
@@ -735,26 +797,57 @@ actual fun PlatformMapView(
                                     .fillMaxWidth()
                                     .verticalScroll(rememberScrollState()),
                             ) {
-                                recentSearches.forEachIndexed { index, result ->
+                                favoriteFolders.forEachIndexed { index, folder ->
                                     Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .combinedClickable(
                                                 onClick = {
-                                                    selectSearchResult(result)
+                                                    selectedFavoriteFolderId = folder.id
+                                                    pendingAddToFavoriteFolderId = null
+                                                    selectedSearchResult = null
+                                                    searchedLocationMarker = mapLibreMap?.updateSearchMarker(
+                                                        searchedLocationMarker,
+                                                        null,
+                                                    )
+                                                    mapLibreMap?.let { map ->
+                                                        favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, folder.places)
+                                                        map.focusOnPlaces(folder.places)
+                                                    }
                                                     activeTab = BottomNavTab.Map
                                                 },
-                                                onLongClick = { pendingDeleteRecentSearch = result },
+                                                onLongClick = { pendingDeleteFavoriteFolder = folder },
                                             )
                                             .padding(vertical = 10.dp),
                                     ) {
-                                        Text(result.title, style = MaterialTheme.typography.bodyLarge)
-                                        result.subtitle?.let {
-                                            Text(it, style = MaterialTheme.typography.bodySmall)
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(folder.name, style = MaterialTheme.typography.bodyLarge)
+                                                Text(
+                                                    text = "${folder.places.size} 个地点",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                )
+                                            }
+                                            TextButton(
+                                                onClick = {
+                                                    selectedFavoriteFolderId = folder.id
+                                                    pendingAddToFavoriteFolderId = folder.id
+                                                    searchQuery = ""
+                                                    searchError = null
+                                                    searchResults = emptyList()
+                                                    isSearchPageOpen = true
+                                                },
+                                            ) {
+                                                Text("添加地点")
+                                            }
                                         }
                                     }
-                                    if (index != recentSearches.lastIndex) {
-                                        Divider(color = Color.LightGray)
+                                    if (index != favoriteFolders.lastIndex) {
+                                        HorizontalDivider(color = Color.LightGray)
                                     }
                                 }
                             }
@@ -820,7 +913,9 @@ actual fun PlatformMapView(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "搜索",
+                            text = pendingAddToFavoriteFolderId?.let { folderId ->
+                                favoriteFolders.firstOrNull { it.id == folderId }?.let { "添加到：${it.name}" }
+                            } ?: "搜索",
                             style = MaterialTheme.typography.titleMedium,
                         )
                     }
@@ -877,31 +972,16 @@ actual fun PlatformMapView(
                     when {
                         searchQuery.isBlank() -> {
                             Column(modifier = panelModifier) {
-                                if (recentSearches.isEmpty()) {
+                                if (pendingAddToFavoriteFolderId != null) {
                                     Text(
-                                        text = "暂无最近搜索",
+                                        text = "输入关键词后，点击结果即可加入收藏夹",
                                         style = MaterialTheme.typography.bodyMedium,
                                     )
                                 } else {
-                                    recentSearches.forEachIndexed { index, result ->
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .combinedClickable(
-                                                    onClick = { selectSearchResult(result) },
-                                                    onLongClick = { pendingDeleteRecentSearch = result },
-                                                )
-                                                .padding(vertical = 10.dp),
-                                        ) {
-                                            Text(result.title, style = MaterialTheme.typography.bodyLarge)
-                                            result.subtitle?.let {
-                                                Text(it, style = MaterialTheme.typography.bodySmall)
-                                            }
-                                        }
-                                        if (index != recentSearches.lastIndex) {
-                                            Divider(color = Color.LightGray)
-                                        }
-                                    }
+                                    Text(
+                                        text = "输入关键词开始搜索地点",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
                                 }
                             }
                         }
@@ -942,7 +1022,7 @@ actual fun PlatformMapView(
                                         }
                                     }
                                     if (index != searchResults.lastIndex) {
-                                        Divider(color = Color.LightGray)
+                                        HorizontalDivider(color = Color.LightGray)
                                     }
                                 }
                             }
@@ -953,23 +1033,98 @@ actual fun PlatformMapView(
             }
         }
 
-        pendingDeleteRecentSearch?.let { target ->
+        if (showCreateFavoriteDialog) {
             AlertDialog(
-                onDismissRequest = { pendingDeleteRecentSearch = null },
-                title = { Text("删除历史记录") },
-                text = { Text("确定删除“${target.title}”吗？") },
+                onDismissRequest = {
+                    showCreateFavoriteDialog = false
+                    createFavoriteError = null
+                },
+                title = { Text("新建收藏夹") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = newFavoriteName,
+                            onValueChange = {
+                                newFavoriteName = it
+                                createFavoriteError = null
+                            },
+                            singleLine = true,
+                            placeholder = { Text("例如：周末去处") },
+                        )
+                        createFavoriteError?.let {
+                            Text(text = it, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                },
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            recentSearches = context.deleteRecentSearch(target, recentSearches)
-                            pendingDeleteRecentSearch = null
+                            val trimmed = newFavoriteName.trim()
+                            when {
+                                trimmed.isBlank() -> {
+                                    createFavoriteError = "收藏夹名称不能为空"
+                                }
+                                favoriteFolders.any { it.name.equals(trimmed, ignoreCase = true) } -> {
+                                    createFavoriteError = "收藏夹名称已存在"
+                                }
+                                else -> {
+                                    val created = FavoriteFolder(
+                                        id = "fav_${System.currentTimeMillis()}_${trimmed.hashCode()}",
+                                        name = trimmed,
+                                        places = emptyList(),
+                                    )
+                                    favoriteFolders = context.saveFavoriteFolders(favoriteFolders + created)
+                                    selectedFavoriteFolderId = created.id
+                                    showCreateFavoriteDialog = false
+                                    createFavoriteError = null
+                                    newFavoriteName = ""
+                                }
+                            }
+                        },
+                    ) {
+                        Text("创建")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showCreateFavoriteDialog = false
+                            createFavoriteError = null
+                        },
+                    ) {
+                        Text("取消")
+                    }
+                },
+            )
+        }
+
+        pendingDeleteFavoriteFolder?.let { target ->
+            AlertDialog(
+                onDismissRequest = { pendingDeleteFavoriteFolder = null },
+                title = { Text("删除收藏夹") },
+                text = { Text("确定删除“${target.name}”吗？") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            favoriteFolders = context.deleteFavoriteFolder(target.id, favoriteFolders)
+                            if (selectedFavoriteFolderId == target.id) {
+                                selectedFavoriteFolderId = favoriteFolders.firstOrNull()?.id
+                                val nextPlaces = favoriteFolders
+                                    .firstOrNull { it.id == selectedFavoriteFolderId }
+                                    ?.places
+                                    .orEmpty()
+                                mapLibreMap?.let { map ->
+                                    favoriteMarkers = map.updateFavoriteMarkers(favoriteMarkers, nextPlaces)
+                                }
+                            }
+                            pendingDeleteFavoriteFolder = null
                         },
                     ) {
                         Text("删除")
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { pendingDeleteRecentSearch = null }) {
+                    TextButton(onClick = { pendingDeleteFavoriteFolder = null }) {
                         Text("取消")
                     }
                 },
@@ -994,10 +1149,31 @@ private fun MapLibreMap.focusOnSearchResult(searchLatLng: LatLng) {
     animateCamera(CameraUpdateFactory.newCameraPosition(camera))
 }
 
+private fun MapLibreMap.focusOnPlaces(places: List<PhotonSearchResult>) {
+    if (places.isEmpty()) return
+    if (places.size == 1) {
+        focusOnSearchResult(places.first().latLng)
+        return
+    }
+
+    val boundsBuilder = LatLngBounds.Builder()
+    places.forEach { boundsBuilder.include(it.latLng) }
+    val bounds = boundsBuilder.build()
+    animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, 120))
+}
+
 private fun MapLibreMap.updateUserMarker(currentMarker: Marker?, userLatLng: LatLng?, icon: MapLibreIcon): Marker? {
     if (userLatLng == null) {
         currentMarker?.let { removeMarker(it) }
         return null
+    }
+
+    if (
+        currentMarker != null &&
+            hasSameLatLng(currentMarker.position, userLatLng) &&
+            currentMarker.title == "My location"
+    ) {
+        return currentMarker
     }
 
     currentMarker?.let { removeMarker(it) }
@@ -1018,6 +1194,10 @@ private fun MapLibreMap.updateSearchMarker(
         return null
     }
 
+    if (currentMarker != null && currentMarker.matches(searchResult)) {
+        return currentMarker
+    }
+
     currentMarker?.let { removeMarker(it) }
     return addMarker(
         MarkerOptions()
@@ -1025,6 +1205,83 @@ private fun MapLibreMap.updateSearchMarker(
             .title(searchResult.title)
             .snippet(searchResult.subtitle ?: ""),
     )
+}
+
+private fun MapLibreMap.updateFavoriteMarkers(
+    currentMarkers: List<Marker>,
+    places: List<PhotonSearchResult>,
+): List<Marker> {
+    if (
+        currentMarkers.size == places.size &&
+            currentMarkers.zip(places).all { (marker, place) -> marker.matches(place) }
+    ) {
+        return currentMarkers
+    }
+
+    val reusableMarkersByKey = mutableMapOf<MarkerStableKey, ArrayDeque<Marker>>()
+    currentMarkers.forEach { marker ->
+        reusableMarkersByKey
+            .getOrPut(marker.toStableKey()) { ArrayDeque() }
+            .addLast(marker)
+    }
+
+    val nextMarkers = mutableListOf<Marker>()
+    places.forEach { place ->
+        val key = place.toStableKey()
+        val reusedMarker = reusableMarkersByKey[key]?.removeFirstOrNull()
+        if (reusedMarker != null) {
+            nextMarkers += reusedMarker
+        } else {
+            nextMarkers += addMarker(
+                MarkerOptions()
+                    .position(place.latLng)
+                    .title(place.title)
+                    .snippet(place.subtitle ?: ""),
+            )
+        }
+    }
+
+    reusableMarkersByKey.values.forEach { staleMarkers ->
+        staleMarkers.forEach { removeMarker(it) }
+    }
+
+    return nextMarkers
+}
+
+private data class MarkerStableKey(
+    val latE6: Long,
+    val lonE6: Long,
+    val title: String,
+    val subtitle: String,
+)
+
+private fun PhotonSearchResult.toStableKey(): MarkerStableKey {
+    return MarkerStableKey(
+        latE6 = (latLng.latitude * 1_000_000.0).roundToLong(),
+        lonE6 = (latLng.longitude * 1_000_000.0).roundToLong(),
+        title = title,
+        subtitle = subtitle ?: "",
+    )
+}
+
+private fun Marker.toStableKey(): MarkerStableKey {
+    return MarkerStableKey(
+        latE6 = (position.latitude * 1_000_000.0).roundToLong(),
+        lonE6 = (position.longitude * 1_000_000.0).roundToLong(),
+        title = title ?: "",
+        subtitle = snippet ?: "",
+    )
+}
+
+private fun Marker.matches(place: PhotonSearchResult): Boolean {
+    return hasSameLatLng(position, place.latLng) &&
+        title == place.title &&
+        snippet.orEmpty() == (place.subtitle ?: "")
+}
+
+private fun hasSameLatLng(first: LatLng, second: LatLng, epsilon: Double = 1e-6): Boolean {
+    return kotlin.math.abs(first.latitude - second.latitude) <= epsilon &&
+        kotlin.math.abs(first.longitude - second.longitude) <= epsilon
 }
 
 private suspend fun searchPhoton(
@@ -1146,25 +1403,39 @@ private fun parsePhotonResults(responseBody: String): List<PhotonSearchResult> {
     return results
 }
 
-private fun Context.loadRecentSearches(): List<PhotonSearchResult> {
+private fun Context.loadFavoriteFolders(): List<FavoriteFolder> {
     val sharedPreferences = getSearchSharedPreferences()
-    val raw = sharedPreferences.getString(RECENT_SEARCHES_KEY, null) ?: return emptyList()
+    val raw = sharedPreferences.getString(FAVORITE_FOLDERS_KEY, null) ?: return emptyList()
     return runCatching {
         val jsonArray = JSONArray(raw)
         buildList {
             for (index in 0 until jsonArray.length()) {
-                val item = jsonArray.optJSONObject(index) ?: continue
-                val title = item.optString("title")
-                val subtitle = item.optString("subtitle").ifBlank { null }
-                val latitude = item.optDouble("latitude", Double.NaN)
-                val longitude = item.optDouble("longitude", Double.NaN)
-                if (!latitude.isFinite() || !longitude.isFinite() || title.isBlank()) continue
+                val folderObject = jsonArray.optJSONObject(index) ?: continue
+                val id = folderObject.optString("id").ifBlank { continue }
+                val name = folderObject.optString("name").ifBlank { continue }
+                val placesArray = folderObject.optJSONArray("places") ?: JSONArray()
+                val places = mutableListOf<PhotonSearchResult>()
 
-                add(
-                    PhotonSearchResult(
+                for (placeIndex in 0 until placesArray.length()) {
+                    val item = placesArray.optJSONObject(placeIndex) ?: continue
+                    val title = item.optString("title")
+                    val subtitle = item.optString("subtitle").ifBlank { null }
+                    val latitude = item.optDouble("latitude", Double.NaN)
+                    val longitude = item.optDouble("longitude", Double.NaN)
+                    if (!latitude.isFinite() || !longitude.isFinite() || title.isBlank()) continue
+
+                    places += PhotonSearchResult(
                         title = title,
                         subtitle = subtitle,
                         latLng = LatLng(latitude, longitude),
+                    )
+                }
+
+                add(
+                    FavoriteFolder(
+                        id = id,
+                        name = name,
+                        places = places,
                     ),
                 )
             }
@@ -1172,54 +1443,57 @@ private fun Context.loadRecentSearches(): List<PhotonSearchResult> {
     }.getOrDefault(emptyList())
 }
 
-private fun Context.saveRecentSearch(
-    latest: PhotonSearchResult,
-    current: List<PhotonSearchResult>,
-): List<PhotonSearchResult> {
-    val updated = (listOf(latest) + current)
-        .distinctBy { "${it.title}:${it.latLng.latitude}:${it.latLng.longitude}" }
-        .take(MAX_RECENT_SEARCHES)
+private fun Context.saveFavoriteFolders(folders: List<FavoriteFolder>): List<FavoriteFolder> {
+    val updated = folders.take(MAX_FAVORITE_FOLDERS)
 
     val jsonArray = JSONArray()
-    updated.forEach { item ->
+    updated.forEach { folder ->
+        val placesArray = JSONArray()
+        folder.places.take(MAX_FAVORITE_PLACES_PER_FOLDER).forEach { item ->
+            placesArray.put(
+                JSONObject().apply {
+                    put("title", item.title)
+                    put("subtitle", item.subtitle ?: "")
+                    put("latitude", item.latLng.latitude)
+                    put("longitude", item.latLng.longitude)
+                },
+            )
+        }
+
         jsonArray.put(
             JSONObject().apply {
-                put("title", item.title)
-                put("subtitle", item.subtitle ?: "")
-                put("latitude", item.latLng.latitude)
-                put("longitude", item.latLng.longitude)
+                put("id", folder.id)
+                put("name", folder.name)
+                put("places", placesArray)
             },
         )
     }
 
-    getSearchSharedPreferences().edit().putString(RECENT_SEARCHES_KEY, jsonArray.toString()).apply()
+    getSearchSharedPreferences().edit().putString(FAVORITE_FOLDERS_KEY, jsonArray.toString()).apply()
     return updated
 }
 
-private fun Context.deleteRecentSearch(
-    target: PhotonSearchResult,
-    current: List<PhotonSearchResult>,
-): List<PhotonSearchResult> {
-    val updated = current.filterNot {
-        it.title == target.title &&
-            it.latLng.latitude == target.latLng.latitude &&
-            it.latLng.longitude == target.latLng.longitude
+private fun Context.addPlaceToFavoriteFolder(
+    folderId: String,
+    place: PhotonSearchResult,
+    current: List<FavoriteFolder>,
+): List<FavoriteFolder> {
+    val updated = current.map { folder ->
+        if (folder.id != folderId) return@map folder
+        val nextPlaces = (folder.places + place)
+            .distinctBy { "${it.title}:${it.latLng.latitude}:${it.latLng.longitude}" }
+            .take(MAX_FAVORITE_PLACES_PER_FOLDER)
+        folder.copy(places = nextPlaces)
     }
+    return saveFavoriteFolders(updated)
+}
 
-    val jsonArray = JSONArray()
-    updated.forEach { item ->
-        jsonArray.put(
-            JSONObject().apply {
-                put("title", item.title)
-                put("subtitle", item.subtitle ?: "")
-                put("latitude", item.latLng.latitude)
-                put("longitude", item.latLng.longitude)
-            },
-        )
-    }
-
-    getSearchSharedPreferences().edit().putString(RECENT_SEARCHES_KEY, jsonArray.toString()).apply()
-    return updated
+private fun Context.deleteFavoriteFolder(
+    folderId: String,
+    current: List<FavoriteFolder>,
+): List<FavoriteFolder> {
+    val updated = current.filterNot { it.id == folderId }
+    return saveFavoriteFolders(updated)
 }
 
 private fun Context.getSearchSharedPreferences(): SharedPreferences {
@@ -1227,8 +1501,9 @@ private fun Context.getSearchSharedPreferences(): SharedPreferences {
 }
 
 private const val SEARCH_PREFS_NAME = "map_search"
-private const val RECENT_SEARCHES_KEY = "recent_searches"
-private const val MAX_RECENT_SEARCHES = 8
+private const val FAVORITE_FOLDERS_KEY = "favorite_folders"
+private const val MAX_FAVORITE_FOLDERS = 12
+private const val MAX_FAVORITE_PLACES_PER_FOLDER = 100
 
 private fun Context.createUserLocationBlueDotIcon(): MapLibreIcon {
     val density = resources.displayMetrics.density
